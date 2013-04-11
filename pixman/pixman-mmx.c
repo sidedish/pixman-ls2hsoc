@@ -2126,6 +2126,75 @@ mmx_combine_conjoint_xor_ca (pixman_implementation_t *imp,
     mmx_combine_conjoint_general_ca (dest, src, mask, width, COMBINE_XOR);
 }
 
+/*
+ * Multiply
+ * B(Dca, ad, Sca, as) = Dca.Sca
+ */
+ 
+static void
+mmx_combine_multiply_u (pixman_implementation_t *imp,
+                    pixman_op_t              op,
+                    uint32_t *                dest,
+                    const uint32_t *          src,
+                    const uint32_t *          mask,
+                    int                      width)
+{
+    const uint32_t *end = dest + width;
+
+    while (dest < end)
+    {
+	__m64 dia, d, sia;
+	__m64 s = combine (src, mask); 
+	__m64 ss = s;
+	d = load8888 (dest);   
+	sia = negate (expand_alpha (s));     
+	dia = negate (expand_alpha (d));
+	ss = pix_add_mul (ss, dia, d, sia);
+	d = pix_multiply (d, s);
+	d = pix_add (d, ss);	
+	store8888 (dest, d);
+
+	++dest;
+	++src;
+	if (mask)
+		mask++;
+    }
+    _mm_empty ();
+}
+ 
+static void
+mmx_combine_multiply_ca (pixman_implementation_t *imp,
+                     pixman_op_t              op,
+                     uint32_t *                dest,
+                     const uint32_t *          src,
+                     const uint32_t *          mask,
+                     int                      width)
+{
+    const uint32_t *end = dest + width;
+
+    while (dest < end)
+    {
+	__m64 a = load8888 (mask);
+	__m64 s = load8888 (src);
+	__m64 d = load8888 (dest);
+	__m64 r = d;	
+	__m64 da = negate (expand_alpha (d));
+	__m64 sa = expand_alpha (s);
+	s = pix_multiply (s, a);
+	a = pix_multiply (a, sa);
+	a = negate (a);
+	r = pix_add_mul (r, a, s, da);
+	d = pix_multiply (d, s);
+	r = pix_add (r, d);
+	store8888 (dest, r);
+
+	++src;
+	++dest;
+	++mask;
+    }
+    _mm_empty ();
+}
+
 /* ------------- MMX code paths called from fbpict.c -------------------- */
 
 static void
@@ -4840,6 +4909,9 @@ _pixman_implementation_create_mmx (pixman_implementation_t *fallback)
     imp->combine_32[PIXMAN_OP_CONJOINT_ATOP_REVERSE] = mmx_combine_conjoint_atop_reverse_u;
     imp->combine_32[PIXMAN_OP_CONJOINT_XOR] = mmx_combine_conjoint_xor_u;
     
+	/* Multiply, Unified */
+	imp->combine_32[PIXMAN_OP_MULTIPLY] = mmx_combine_multiply_u;
+	
     /* Component alpha combiners */
     imp->combine_32_ca[PIXMAN_OP_SRC] = mmx_combine_src_ca;
     imp->combine_32_ca[PIXMAN_OP_OVER] = mmx_combine_over_ca;
@@ -4875,6 +4947,9 @@ _pixman_implementation_create_mmx (pixman_implementation_t *fallback)
     imp->combine_32_ca[PIXMAN_OP_CONJOINT_ATOP] = mmx_combine_conjoint_atop_ca;
     imp->combine_32_ca[PIXMAN_OP_CONJOINT_ATOP_REVERSE] = mmx_combine_conjoint_atop_reverse_ca;
     imp->combine_32_ca[PIXMAN_OP_CONJOINT_XOR] = mmx_combine_conjoint_xor_ca;
+
+	/* Multiply CA */
+	imp->combine_32_ca[PIXMAN_OP_MULTIPLY] = mmx_combine_multiply_ca;
 
     imp->blt = mmx_blt;
     imp->fill = mmx_fill;
