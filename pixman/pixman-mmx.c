@@ -59,6 +59,73 @@ _mm_empty (void)
 }
 #endif
 
+#define COMBINE_A_OUT 1
+#define COMBINE_A_IN  2
+#define COMBINE_B_OUT 4
+#define COMBINE_B_IN  8
+
+#define COMBINE_CLEAR   0
+#define COMBINE_A       (COMBINE_A_OUT | COMBINE_A_IN)
+#define COMBINE_B       (COMBINE_B_OUT | COMBINE_B_IN)
+#define COMBINE_A_OVER  (COMBINE_A_OUT | COMBINE_B_OUT | COMBINE_A_IN)
+#define COMBINE_B_OVER  (COMBINE_A_OUT | COMBINE_B_OUT | COMBINE_B_IN)
+#define COMBINE_A_ATOP  (COMBINE_B_OUT | COMBINE_A_IN)
+#define COMBINE_B_ATOP  (COMBINE_A_OUT | COMBINE_B_IN)
+#define COMBINE_XOR     (COMBINE_A_OUT | COMBINE_B_OUT)
+
+/* no SIMD instructions for div, so leave it alone */
+/* portion covered by a but not b */
+static uint8_t
+combine_disjoint_out_part (uint8_t a, uint8_t b)
+{
+    /* min (1, (1-b) / a) */
+
+    b = ~b;                 /* 1 - b */
+    if (b >= a)             /* 1 - b >= a -> (1-b)/a >= 1 */
+	return MASK;        /* 1 */
+    return DIV_UN8 (b, a);     /* (1-b) / a */
+}
+
+/* portion covered by both a and b */
+static uint8_t
+combine_disjoint_in_part (uint8_t a, uint8_t b)
+{
+    /* max (1-(1-b)/a,0) */
+    /*  = - min ((1-b)/a - 1, 0) */
+    /*  = 1 - min (1, (1-b)/a) */
+
+    b = ~b;                 /* 1 - b */
+    if (b >= a)             /* 1 - b >= a -> (1-b)/a >= 1 */
+	return 0;           /* 1 - 1 */
+    return ~DIV_UN8(b, a);    /* 1 - (1-b) / a */
+}
+
+/* portion covered by a but not b */
+static uint8_t
+combine_conjoint_out_part (uint8_t a, uint8_t b)
+{
+    /* max (1-b/a,0) */
+    /* = 1-min(b/a,1) */
+
+    /* min (1, (1-b) / a) */
+
+    if (b >= a)             /* b >= a -> b/a >= 1 */
+	return 0x00;        /* 0 */
+    return ~DIV_UN8(b, a);    /* 1 - b/a */
+}
+
+/* portion covered by both a and b */
+static uint8_t
+combine_conjoint_in_part (uint8_t a, uint8_t b)
+{
+    /* min (1,b/a) */
+
+    if (b >= a)             /* b >= a -> b/a >= 1 */
+	return MASK;        /* 1 */
+    return DIV_UN8 (b, a);     /* b/a */
+}
+
+
 #ifdef USE_X86_MMX
 # if (defined(__SUNPRO_C) || defined(_MSC_VER) || defined(_WIN64))
 #  include <xmmintrin.h>
@@ -66,6 +133,7 @@ _mm_empty (void)
 /* We have to compile with -msse to use xmmintrin.h, but that causes SSE
  * instructions to be generated that we don't want. Just duplicate the
  * functions we want to use.  */
+
 extern __inline int __attribute__((__gnu_inline__, __always_inline__, __artificial__))
 _mm_movemask_pi8 (__m64 __A)
 {
@@ -702,6 +770,34 @@ combine (const uint32_t *src, const uint32_t *mask)
     return vsrc;
 }
 
+static force_inline void
+mmx_combine_mask_ca(const uint32_t *src, const uint32_t *mask, __m64 *s64, __m64 *m64)
+{
+    __m64 res, tmp;
+    
+    if(!(*mask))
+	{
+	    *s64 = 0;
+	    *m64 = 0;
+	    return;
+	}
+    
+    *s64 = load8888(src);
+    
+    if (*mask == ~0)
+	{
+	    *m64 = expand_alpha(*s64);
+	    return;
+	}
+    
+    *m64 = load8888(mask);
+    
+    res = pix_multiply(*s64, *m64);
+    tmp = expand_alpha(*s64);
+    *s64 = res;
+    *m64 = pix_multiply(*m64, tmp);
+}
+
 static force_inline __m64
 core_combine_over_u_pixel_mmx (__m64 vsrc, __m64 vdst)
 {
@@ -1016,6 +1112,39 @@ mmx_combine_add_u (pixman_implementation_t *imp,
 }
 
 static void
+mmx_combine_disjoint_over_u (pixman_implementation_t *imp,
+			 pixman_op_t              op,
+                         uint32_t *                dest,
+                         const uint32_t *          src,
+                         const uint32_t *          mask,
+                         int                      width)
+{
+    uint32_t *end = dest + width;
+    uint32_t s32;
+    uint64_t sa64;
+    __m64 s64, d64;
+
+    while (dest < end)
+	{
+	    s64 = combine (src, mask);
+	    
+	    if (s64)
+		{
+		    store8888(&s32, s64);
+		    sa64 = combine_disjoint_out_part (*dest >> A_SHIFT, s32 >> A_SHIFT);
+		    d64 = pix_add (pix_multiply (load8888 (dest),expand_alpha_rev ((*(__m64*)&sa64))), s64);
+		    store8888 (dest, d64);
+		}
+	    
+	    ++dest;
+	    ++src;
+	    if (mask)
+		++mask;
+	    
+	}
+}
+
+static void
 mmx_combine_saturate_u (pixman_implementation_t *imp,
                         pixman_op_t              op,
                         uint32_t *               dest,
@@ -1055,6 +1184,297 @@ mmx_combine_saturate_u (pixman_implementation_t *imp,
     _mm_empty ();
 }
 
+/* 在combine_conjoint_general_u等函数中,有多个分支,由参数combine决定,*/
+/*此值在函数运行期间并不会改变,所以原始代码中每个值都去判断是没有必要的.*/
+/*可以在函数入口处判断,并设置好相应的函数指针,以后直接调用即可.*/
+/*有两个分支是直接返回常量,为了做到统一,自定义两个内联函数,其作用为直接返回相应的常量.*/
+/*_u和_ca后綴的两套代均码可用*/
+#define DEF_FUNC_ZERO_MASK(type, zm, suffix, res)			\
+    static type inline combine_joint_ ##zm## _ ##suffix( type sa, type da, type io_flag) \
+    {									\
+	return res;							\
+    }									
+
+/* 四个分支中的另外两个分支函数,conjoint与disjoint的代码结构一样,函数名不一样,设置此宏来生成相应的函数*/
+/* 参数顺序不一样,由io_flag标记决定,0表示in_part,1表示out_part*/
+/*由于是底层函数,并不向外提供此接口,因此这里没有判断其值是否合法. */
+#define DEF_FUNC_COMBINE_JOINT_U(cd, io)				\
+    static uint8_t inline combine_ ##cd## joint_ ##io## _part_u(uint8_t sa, uint8_t da, uint8_t io_flag) \
+    {									\
+	uint8_t parm[2];						\
+	parm[0] = sa * (io_flag ^ 0x1) + da * (io_flag ^ 0x0);		\
+	parm[1] = sa * (io_flag ^ 0x0) + da * (io_flag ^ 0x1);		\
+	return combine_ ##cd## joint_ ##io## _part (parm[0], parm[1]);	\
+    }
+
+/* 设置函数指针数组的宏,在函数入口处存放正确的处理函数. */
+/*_u和_ca后綴的两套代均码可用*/
+#define DEF_COMB_FUNC_ARR(cd,SUFFIX,suffix)				\
+    COMBINE_JOINT_FUNC_##SUFFIX combine_ ##cd## joint_ ##suffix[4] ={	\
+	combine_joint_zero_ ##suffix,					\
+	combine_ ##cd## joint_out_part_ ##suffix,			\
+	combine_ ##cd## joint_in_part_ ##suffix,			\
+	combine_joint_mask_ ##suffix					\
+    };
+
+typedef  uint8_t (*COMBINE_JOINT_FUNC_U)(uint8_t a, uint8_t b, uint8_t io_flag);
+
+DEF_FUNC_ZERO_MASK(uint8_t,zero,u, 0x0)
+DEF_FUNC_ZERO_MASK(uint8_t,mask,u, ~0x0)
+
+DEF_FUNC_COMBINE_JOINT_U(dis, in);
+DEF_FUNC_COMBINE_JOINT_U(dis, out);
+DEF_COMB_FUNC_ARR(dis,U,u)
+
+DEF_FUNC_COMBINE_JOINT_U(con, in);
+DEF_FUNC_COMBINE_JOINT_U(con, out);
+DEF_COMB_FUNC_ARR(con, U, u)
+
+/* conjoint与disjoint相关函数主体结构一样的,只是四个分支中调用的函数不同,因此设置一个底层函数*/
+static void
+mmx_combine_joint_general_u (uint32_t * dest,
+			 const uint32_t *src,
+			 const uint32_t *mask,
+			 int            width,
+			 uint8_t        comb,
+			 COMBINE_JOINT_FUNC_U *cjf)
+{
+    COMBINE_JOINT_FUNC_U combine_joint_u[2];
+    combine_joint_u[0] = cjf[comb & COMBINE_A]; /* in_part */
+    combine_joint_u[1] = cjf[(comb & COMBINE_B)>>2]; /* out_par */
+    
+    uint32_t *end = dest + width;
+    while (dest < end)
+	{
+	    __m64 s64 = combine (src, mask);
+	    __m64 d64,sa64,da64;
+	    uint8_t sa, da;
+	    uint32_t tmp;
+	    uint64_t Fa, Fb;
+	        
+	    /* 由于这些函数中有除法指令,因此并未用多媒体指令来优化, */
+	    /* 从而需要再转存到uint32_t类型变量中,再取出运算.*/
+	    store8888(&tmp, s64);
+	    sa = tmp >> A_SHIFT;
+	    da = *dest >> A_SHIFT;
+	        
+	    Fa = combine_joint_u[0](sa, da, 0);
+	    Fb = combine_joint_u[1](sa, da, 1);
+	        
+	    d64 = load8888(dest);
+	    sa64 = expand_alpha_rev (*(__m64*)&Fa);
+	    da64 = expand_alpha_rev (*(__m64*)&Fb);
+	        
+	    d64 = pix_add_mul (s64, sa64, d64, da64);
+	        
+	    store8888 (dest, d64);
+	        
+	    ++dest;
+	    ++src;
+	    if (mask)
+		++mask;
+	}
+}
+
+
+static void
+mmx_combine_disjoint_general_u (uint32_t * dest,
+				const uint32_t *src,
+				const uint32_t *mask,
+				int            width,
+				uint8_t        comb)
+{
+    mmx_combine_joint_general_u (dest, src, mask, width, comb, combine_disjoint_u);
+}
+
+static void
+mmx_combine_disjoint_in_u (pixman_implementation_t *imp,
+			   pixman_op_t              op,
+			   uint32_t *                dest,
+			   const uint32_t *          src,
+			   const uint32_t *          mask,
+			   int                      width)
+{
+    mmx_combine_disjoint_general_u (dest, src, mask, width, COMBINE_A_IN);
+}
+
+static void
+mmx_combine_disjoint_in_reverse_u (pixman_implementation_t *imp,
+				   pixman_op_t              op,
+				   uint32_t *                dest,
+				   const uint32_t *          src,
+				   const uint32_t *          mask,
+				   int                      width)
+{
+    mmx_combine_disjoint_general_u (dest, src, mask, width, COMBINE_B_IN);
+}
+
+static void
+mmx_combine_disjoint_out_u (pixman_implementation_t *imp,
+			    pixman_op_t              op,
+			    uint32_t *                dest,
+			    const uint32_t *          src,
+			    const uint32_t *          mask,
+			    int                      width)
+{
+    mmx_combine_disjoint_general_u (dest, src, mask, width, COMBINE_A_OUT);
+}
+
+static void
+mmx_combine_disjoint_out_reverse_u (pixman_implementation_t *imp,
+				    pixman_op_t              op,
+				    uint32_t *                dest,
+				    const uint32_t *          src,
+				    const uint32_t *          mask,
+				    int                      width)
+{
+    mmx_combine_disjoint_general_u (dest, src, mask, width, COMBINE_B_OUT);
+}
+
+static void
+mmx_combine_disjoint_atop_u (pixman_implementation_t *imp,
+			     pixman_op_t              op,
+			     uint32_t *                dest,
+			     const uint32_t *          src,
+			     const uint32_t *          mask,
+			     int                      width)
+{
+    mmx_combine_disjoint_general_u (dest, src, mask, width, COMBINE_A_ATOP);
+}
+
+static void
+mmx_combine_disjoint_atop_reverse_u (pixman_implementation_t *imp,
+				     pixman_op_t              op,
+				     uint32_t *                dest,
+				     const uint32_t *          src,
+				     const uint32_t *          mask,
+				     int                      width)
+{
+    mmx_combine_disjoint_general_u (dest, src, mask, width, COMBINE_B_ATOP);
+}
+
+static void
+mmx_combine_disjoint_xor_u (pixman_implementation_t *imp,
+			    pixman_op_t              op,
+			    uint32_t *                dest,
+			    const uint32_t *          src,
+			    const uint32_t *          mask,
+			    int                      width)
+{
+    mmx_combine_disjoint_general_u (dest, src, mask, width, COMBINE_XOR);
+}
+
+/* Conjoint */
+static void
+mmx_combine_conjoint_general_u(uint32_t * dest,
+			       const uint32_t *src,
+			       const uint32_t *mask,
+			       int            width,
+			       uint8_t        comb)
+{
+    mmx_combine_joint_general_u (dest, src, mask, width, comb, combine_conjoint_u);
+}
+
+static void
+mmx_combine_conjoint_over_u (pixman_implementation_t *imp,
+			     pixman_op_t              op,
+			     uint32_t *                dest,
+			     const uint32_t *          src,
+			     const uint32_t *          mask,
+			     int                      width)
+{
+    mmx_combine_conjoint_general_u (dest, src, mask, width, COMBINE_A_OVER);
+}
+
+static void
+mmx_combine_conjoint_over_reverse_u (pixman_implementation_t *imp,
+				     pixman_op_t              op,
+				     uint32_t *                dest,
+				     const uint32_t *          src,
+				     const uint32_t *          mask,
+				     int                      width)
+{
+    mmx_combine_conjoint_general_u (dest, src, mask, width, COMBINE_B_OVER);
+}
+
+static void
+mmx_combine_conjoint_in_u (pixman_implementation_t *imp,
+			   pixman_op_t              op,
+			   uint32_t *                dest,
+			   const uint32_t *          src,
+			   const uint32_t *          mask,
+			   int                      width)
+{
+    mmx_combine_conjoint_general_u (dest, src, mask, width, COMBINE_A_IN);
+}
+
+static void
+mmx_combine_conjoint_in_reverse_u (pixman_implementation_t *imp,
+				   pixman_op_t              op,
+				   uint32_t *                dest,
+				   const uint32_t *          src,
+				   const uint32_t *          mask,
+				   int                      width)
+{
+    mmx_combine_conjoint_general_u (dest, src, mask, width, COMBINE_B_IN);
+}
+
+static void
+mmx_combine_conjoint_out_u (pixman_implementation_t *imp,
+			    pixman_op_t              op,
+			    uint32_t *                dest,
+			    const uint32_t *          src,
+			    const uint32_t *          mask,
+			    int                      width)
+{
+    mmx_combine_conjoint_general_u (dest, src, mask, width, COMBINE_A_OUT);
+}
+
+static void
+mmx_combine_conjoint_out_reverse_u (pixman_implementation_t *imp,
+				    pixman_op_t              op,
+				    uint32_t *                dest,
+				    const uint32_t *          src,
+				    const uint32_t *          mask,
+				    int                      width)
+{
+    mmx_combine_conjoint_general_u (dest, src, mask, width, COMBINE_B_OUT);
+}
+
+static void
+mmx_combine_conjoint_atop_u (pixman_implementation_t *imp,
+			     pixman_op_t              op,
+			     uint32_t *                dest,
+			     const uint32_t *          src,
+			     const uint32_t *          mask,
+			     int                      width)
+{
+    mmx_combine_conjoint_general_u (dest, src, mask, width, COMBINE_A_ATOP);
+}
+
+static void
+mmx_combine_conjoint_atop_reverse_u (pixman_implementation_t *imp,
+				     pixman_op_t              op,
+				     uint32_t *                dest,
+				     const uint32_t *          src,
+				     const uint32_t *          mask,
+				     int                      width)
+{
+    mmx_combine_conjoint_general_u (dest, src, mask, width, COMBINE_B_ATOP);
+}
+
+static void
+mmx_combine_conjoint_xor_u (pixman_implementation_t *imp,
+			    pixman_op_t              op,
+			    uint32_t *                dest,
+			    const uint32_t *          src,
+			    const uint32_t *          mask,
+			    int                      width)
+{
+    mmx_combine_conjoint_general_u (dest, src, mask, width, COMBINE_XOR);
+}
+
+/* Component alpha combiners */
 static void
 mmx_combine_src_ca (pixman_implementation_t *imp,
                     pixman_op_t              op,
@@ -1365,6 +1785,345 @@ mmx_combine_add_ca (pixman_implementation_t *imp,
 	++mask;
     }
     _mm_empty ();
+}
+
+static void
+mmx_combine_saturate_ca (pixman_implementation_t *imp,
+			 pixman_op_t              op,
+			 uint32_t *                dest,
+			 const uint32_t *          src,
+			 const uint32_t *          mask,
+			 int                      width)
+{
+    uint32_t *end = dest + width;
+    while (dest < end)
+	{
+	    uint16_t sa, sr, sg, sb;
+	    uint32_t sa32, m32;
+	    __m64 m64, s64, d64, sa64, da64, cmpf, res;
+	    
+	    mmx_combine_mask_ca (src, mask, &s64, &m64);
+	    
+	    d64 = load8888 (dest);
+	    da64 = expand_alpha (negate(d64));
+	    /*这里涉及到分支,分支中的运算GENERIC实际上是先做乘法,再做ADD,*/
+	    /*而另一分支是ADD,因此可以无条件地先判断,记下标记位,做乘法,*/
+	    /*再将不需要做乘法的相应关字恢复,最后做加法. */
+	    cmpf = _mm_cmpgt_pi16 (m64, da64);
+	    if (cmpf)
+		{
+		    store8888 (&m32, m64);
+		    sa = (m32 >> (A_SHIFT));
+		    sr = (m32 >> (R_SHIFT)) & MASK;
+		    sg = (m32 >> (G_SHIFT)) & MASK;
+		    sb =  m32               & MASK;
+		    sa32 = (~(*dest) >> A_SHIFT) & MASK;
+		    
+		    /* 可能为０，当为０时，其结果肯定将被恢复，因此这里为其随便赋一值 */
+		    sa = (sa) ? sa : 0x1;
+		    sr = (sr) ? sr : 0x1;
+		    sg = (sg) ? sg : 0x1;
+		    sb = (sb) ? sb : 0x1;
+		    
+		    sa32 = ((sa32 << G_SHIFT) / sb & MASK) |
+			((((sa32 << G_SHIFT) / sg) & MASK) << G_SHIFT) |
+			((((sa32 << G_SHIFT) / sr) & MASK) << R_SHIFT) |
+			((((sa32 << G_SHIFT) / sa) & MASK) << A_SHIFT);
+		    sa64 = load8888 (&sa32);
+		    da64 = MC (4x00ff);
+		    res = pix_multiply (s64, sa64);
+		    s64 = _mm_or_si64 (_mm_and_si64 (res, cmpf), _mm_and_si64 (s64, negate (cmpf)));
+		    res = pix_multiply (d64, da64);
+		    d64 = _mm_or_si64 (_mm_and_si64 (res, cmpf), _mm_and_si64 (d64, negate (cmpf)));
+		}
+	    res = _mm_adds_pu8 (s64, d64);
+	    store8888 (dest, res);
+	    
+	    ++dest;
+	    ++src;
+	    if (mask)
+		++mask;
+	}
+}
+
+#define DEF_FUNC_COMBINE_JOINT_CA(cd, io)				\
+    static uint32_t inline combine_ ##cd## joint_ ##io## _part_ca(uint32_t sa, uint32_t da, uint32_t io_flag) \
+    {									\
+	uint8_t da8 = da >> A_SHIFT;					\
+	uint32_t m, n, o, p, res;					\
+	uint8_t i, parm[2][4], shift=0;					\
+	for (i=0; i<4; i++)						\
+	    {								\
+		parm[0][i] = (uint8_t)(sa>>shift) * (io_flag ^ 0x1) + da8 * (io_flag ^ 0x0); \
+		parm[1][i] = (uint8_t)(sa>>shift) * (io_flag ^ 0x0) + da8 * (io_flag ^ 0x1); \
+		shift += G_SHIFT;					\
+	    }								\
+	m = (uint32_t)combine_ ##cd## joint_ ##io## _part (parm[0][0], parm[1][0]); \
+	n = (uint32_t)combine_ ##cd## joint_ ##io## _part (parm[0][1], parm[1][1]) << G_SHIFT; \
+	o = (uint32_t)combine_ ##cd## joint_ ##io## _part (parm[0][2], parm[1][2]) << R_SHIFT; \
+	p = (uint32_t)combine_ ##cd## joint_ ##io## _part (parm[0][3], parm[1][3]) << A_SHIFT; \
+	res = m | n | o | p;						\
+	return res;							\
+    }
+
+typedef  uint32_t (*COMBINE_JOINT_FUNC_CA)(uint32_t sa, uint32_t da, uint32_t io_flag);
+
+DEF_FUNC_ZERO_MASK(uint32_t, zero, ca, 0x0)
+DEF_FUNC_ZERO_MASK(uint32_t, mask, ca, ~0x0)
+
+DEF_FUNC_COMBINE_JOINT_CA(dis, in);
+DEF_FUNC_COMBINE_JOINT_CA(dis, out);
+DEF_COMB_FUNC_ARR(dis, CA, ca)
+
+DEF_FUNC_COMBINE_JOINT_CA(con, in);
+DEF_FUNC_COMBINE_JOINT_CA(con, out);
+DEF_COMB_FUNC_ARR(con, CA, ca)
+
+static void
+mmx_combine_joint_general_ca (uint32_t * dest,
+			      const uint32_t *src,
+			      const uint32_t *mask,
+			      int            width,
+			      uint8_t        comb,
+			      COMBINE_JOINT_FUNC_CA *cjf)
+{
+    COMBINE_JOINT_FUNC_CA combine_joint_ca[2];
+    combine_joint_ca[0] = cjf[comb & COMBINE_A];
+    combine_joint_ca[1] = cjf[(comb & COMBINE_B)>>2];
+    
+    uint32_t *end = dest + width;
+    while (dest < end)
+	{
+	    __m64 m64, s64, sa64, da64, d64;
+	    uint32_t m32, Fa, Fb;
+	    
+	    mmx_combine_mask_ca (src, mask, &s64, &m64);
+	    store8888(&m32, m64);
+	    
+	    Fa = combine_joint_ca[0](m32, *dest, 0);
+	    Fb = combine_joint_ca[1](m32, *dest, 1);
+	    
+	    sa64 = load8888 (&Fa);
+	    da64 = load8888 (&Fb);
+	    
+	    d64 = load8888 (dest);
+	    d64 = pix_add_mul(s64, sa64, d64, da64);
+	    
+	    store8888 (dest, d64);
+	    
+	    ++dest;
+	    ++src;
+	    if (mask)
+		++mask;
+	}
+    
+}
+
+static void
+mmx_combine_disjoint_general_ca (uint32_t * dest,
+				 const uint32_t *src,
+				 const uint32_t *mask,
+				 int            width,
+				 uint8_t        comb)
+{
+    mmx_combine_joint_general_ca (dest, src, mask, width, comb, combine_disjoint_ca);
+}
+
+static void
+mmx_combine_disjoint_over_ca (pixman_implementation_t *imp,
+			      pixman_op_t              op,
+			      uint32_t *                dest,
+			      const uint32_t *          src,
+			      const uint32_t *          mask,
+			      int                      width)
+{
+    mmx_combine_disjoint_general_ca (dest, src, mask, width, COMBINE_A_OVER);
+}
+
+static void
+mmx_combine_disjoint_in_ca (pixman_implementation_t *imp,
+			    pixman_op_t              op,
+			    uint32_t *                dest,
+			    const uint32_t *          src,
+			    const uint32_t *          mask,
+			    int                      width)
+{
+    mmx_combine_disjoint_general_ca (dest, src, mask, width, COMBINE_A_IN);
+}
+
+static void
+mmx_combine_disjoint_in_reverse_ca (pixman_implementation_t *imp,
+				    pixman_op_t              op,
+				    uint32_t *                dest,
+				    const uint32_t *          src,
+				    const uint32_t *          mask,
+				    int                      width)
+{
+    mmx_combine_disjoint_general_ca (dest, src, mask, width, COMBINE_B_IN);
+}
+
+static void
+mmx_combine_disjoint_out_ca (pixman_implementation_t *imp,
+			     pixman_op_t              op,
+			     uint32_t *                dest,
+			     const uint32_t *          src,
+			     const uint32_t *          mask,
+			     int                      width)
+{
+    mmx_combine_disjoint_general_ca (dest, src, mask, width, COMBINE_A_OUT);
+}
+
+static void
+mmx_combine_disjoint_out_reverse_ca (pixman_implementation_t *imp,
+				     pixman_op_t              op,
+				     uint32_t *                dest,
+				     const uint32_t *          src,
+				     const uint32_t *          mask,
+				     int                      width)
+{
+    mmx_combine_disjoint_general_ca (dest, src, mask, width, COMBINE_B_OUT);
+}
+
+static void
+mmx_combine_disjoint_atop_ca (pixman_implementation_t *imp,
+			      pixman_op_t              op,
+			      uint32_t *                dest,
+			      const uint32_t *          src,
+			      const uint32_t *          mask,
+			      int                      width)
+{
+    mmx_combine_disjoint_general_ca (dest, src, mask, width, COMBINE_A_ATOP);
+}
+
+static void
+mmx_combine_disjoint_atop_reverse_ca (pixman_implementation_t *imp,
+				      pixman_op_t              op,
+				      uint32_t *                dest,
+				      const uint32_t *          src,
+				      const uint32_t *          mask,
+				      int                      width)
+{
+    mmx_combine_disjoint_general_ca (dest, src, mask, width, COMBINE_B_ATOP);
+}
+
+static void
+mmx_combine_disjoint_xor_ca (pixman_implementation_t *imp,
+			     pixman_op_t              op,
+			     uint32_t *                dest,
+			     const uint32_t *          src,
+			     const uint32_t *          mask,
+			     int                      width)
+{
+    mmx_combine_disjoint_general_ca (dest, src, mask, width, COMBINE_XOR);
+}
+
+static void
+mmx_combine_conjoint_general_ca(uint32_t * dest,
+				const uint32_t *src,
+				const uint32_t *mask,
+				int            width,
+				uint8_t        comb)
+{
+    mmx_combine_joint_general_ca(dest,src,mask,width,comb,combine_conjoint_ca);
+}
+
+static void
+mmx_combine_conjoint_over_ca (pixman_implementation_t *imp,
+			      pixman_op_t              op,
+			      uint32_t *                dest,
+			      const uint32_t *          src,
+			      const uint32_t *          mask,
+			      int                      width)
+{
+    mmx_combine_conjoint_general_ca (dest, src, mask, width, COMBINE_A_OVER);
+}
+
+static void
+mmx_combine_conjoint_over_reverse_ca (pixman_implementation_t *imp,
+				      pixman_op_t              op,
+				      uint32_t *                dest,
+				      const uint32_t *          src,
+				      const uint32_t *          mask,
+				      int                      width)
+{
+    mmx_combine_conjoint_general_ca (dest, src, mask, width, COMBINE_B_OVER);
+}
+
+static void
+mmx_combine_conjoint_in_ca (pixman_implementation_t *imp,
+			    pixman_op_t              op,
+			    uint32_t *                dest,
+			    const uint32_t *          src,
+			    const uint32_t *          mask,
+			    int                      width)
+{
+    mmx_combine_conjoint_general_ca (dest, src, mask, width, COMBINE_A_IN);
+}
+
+static void
+mmx_combine_conjoint_in_reverse_ca (pixman_implementation_t *imp,
+				    pixman_op_t              op,
+				    uint32_t *                dest,
+				    const uint32_t *          src,
+				    const uint32_t *          mask,
+				    int                      width)
+{
+    mmx_combine_conjoint_general_ca (dest, src, mask, width, COMBINE_B_IN);
+}
+
+static void
+mmx_combine_conjoint_out_ca (pixman_implementation_t *imp,
+			     pixman_op_t              op,
+			     uint32_t *                dest,
+			     const uint32_t *          src,
+			     const uint32_t *          mask,
+			     int                      width)
+{
+    mmx_combine_conjoint_general_ca (dest, src, mask, width, COMBINE_A_OUT);
+}
+
+static void
+mmx_combine_conjoint_out_reverse_ca (pixman_implementation_t *imp,
+				     pixman_op_t              op,
+				     uint32_t *                dest,
+				     const uint32_t *          src,
+				     const uint32_t *          mask,
+				     int                      width)
+{
+    mmx_combine_conjoint_general_ca (dest, src, mask, width, COMBINE_B_OUT);
+}
+
+static void
+mmx_combine_conjoint_atop_ca (pixman_implementation_t *imp,
+			      pixman_op_t              op,
+			      uint32_t *                dest,
+			      const uint32_t *          src,
+			      const uint32_t *          mask,
+			      int                      width)
+{
+    mmx_combine_conjoint_general_ca (dest, src, mask, width, COMBINE_A_ATOP);
+}
+
+static void
+mmx_combine_conjoint_atop_reverse_ca (pixman_implementation_t *imp,
+				      pixman_op_t              op,
+				      uint32_t *                dest,
+				      const uint32_t *          src,
+				      const uint32_t *          mask,
+				      int                      width)
+{
+    mmx_combine_conjoint_general_ca (dest, src, mask, width, COMBINE_B_ATOP);
+}
+
+static void
+mmx_combine_conjoint_xor_ca (pixman_implementation_t *imp,
+			     pixman_op_t              op,
+			     uint32_t *                dest,
+			     const uint32_t *          src,
+			     const uint32_t *          mask,
+			     int                      width)
+{
+    mmx_combine_conjoint_general_ca (dest, src, mask, width, COMBINE_XOR);
 }
 
 /* ------------- MMX code paths called from fbpict.c -------------------- */
@@ -4046,7 +4805,7 @@ pixman_implementation_t *
 _pixman_implementation_create_mmx (pixman_implementation_t *fallback)
 {
     pixman_implementation_t *imp = _pixman_implementation_create (fallback, mmx_fast_paths);
-
+    /* Unified alpha */
     imp->combine_32[PIXMAN_OP_OVER] = mmx_combine_over_u;
     imp->combine_32[PIXMAN_OP_OVER_REVERSE] = mmx_combine_over_reverse_u;
     imp->combine_32[PIXMAN_OP_IN] = mmx_combine_in_u;
@@ -4059,6 +4818,29 @@ _pixman_implementation_create_mmx (pixman_implementation_t *fallback)
     imp->combine_32[PIXMAN_OP_ADD] = mmx_combine_add_u;
     imp->combine_32[PIXMAN_OP_SATURATE] = mmx_combine_saturate_u;
 
+    /* Disjoint, unified */
+    imp->combine_32[PIXMAN_OP_DISJOINT_OVER] = mmx_combine_disjoint_over_u;
+    imp->combine_32[PIXMAN_OP_DISJOINT_OVER_REVERSE] = mmx_combine_saturate_u;
+    imp->combine_32[PIXMAN_OP_DISJOINT_IN] = mmx_combine_disjoint_in_u;
+    imp->combine_32[PIXMAN_OP_DISJOINT_IN_REVERSE] = mmx_combine_disjoint_in_reverse_u;
+    imp->combine_32[PIXMAN_OP_DISJOINT_OUT] = mmx_combine_disjoint_out_u;
+    imp->combine_32[PIXMAN_OP_DISJOINT_OUT_REVERSE] = mmx_combine_disjoint_out_reverse_u;
+    imp->combine_32[PIXMAN_OP_DISJOINT_ATOP] = mmx_combine_disjoint_atop_u;
+    imp->combine_32[PIXMAN_OP_DISJOINT_ATOP_REVERSE] = mmx_combine_disjoint_atop_reverse_u;
+    imp->combine_32[PIXMAN_OP_DISJOINT_XOR] = mmx_combine_disjoint_xor_u;
+
+    /* Conjoint, unified */
+    imp->combine_32[PIXMAN_OP_CONJOINT_OVER] = mmx_combine_conjoint_over_u;
+    imp->combine_32[PIXMAN_OP_CONJOINT_OVER_REVERSE] = mmx_combine_conjoint_over_reverse_u;
+    imp->combine_32[PIXMAN_OP_CONJOINT_IN] = mmx_combine_conjoint_in_u;
+    imp->combine_32[PIXMAN_OP_CONJOINT_IN_REVERSE] = mmx_combine_conjoint_in_reverse_u;
+    imp->combine_32[PIXMAN_OP_CONJOINT_OUT] = mmx_combine_conjoint_out_u;
+    imp->combine_32[PIXMAN_OP_CONJOINT_OUT_REVERSE] = mmx_combine_conjoint_out_reverse_u;
+    imp->combine_32[PIXMAN_OP_CONJOINT_ATOP] = mmx_combine_conjoint_atop_u;
+    imp->combine_32[PIXMAN_OP_CONJOINT_ATOP_REVERSE] = mmx_combine_conjoint_atop_reverse_u;
+    imp->combine_32[PIXMAN_OP_CONJOINT_XOR] = mmx_combine_conjoint_xor_u;
+    
+    /* Component alpha combiners */
     imp->combine_32_ca[PIXMAN_OP_SRC] = mmx_combine_src_ca;
     imp->combine_32_ca[PIXMAN_OP_OVER] = mmx_combine_over_ca;
     imp->combine_32_ca[PIXMAN_OP_OVER_REVERSE] = mmx_combine_over_reverse_ca;
@@ -4070,6 +4852,29 @@ _pixman_implementation_create_mmx (pixman_implementation_t *fallback)
     imp->combine_32_ca[PIXMAN_OP_ATOP_REVERSE] = mmx_combine_atop_reverse_ca;
     imp->combine_32_ca[PIXMAN_OP_XOR] = mmx_combine_xor_ca;
     imp->combine_32_ca[PIXMAN_OP_ADD] = mmx_combine_add_ca;
+    imp->combine_32_ca[PIXMAN_OP_SATURATE] = mmx_combine_saturate_ca;
+
+    /* Disjoint CA */
+    imp->combine_32_ca[PIXMAN_OP_DISJOINT_OVER] = mmx_combine_disjoint_over_ca;
+    imp->combine_32_ca[PIXMAN_OP_DISJOINT_OVER_REVERSE] = mmx_combine_saturate_ca;
+    imp->combine_32_ca[PIXMAN_OP_DISJOINT_IN] = mmx_combine_disjoint_in_ca;
+    imp->combine_32_ca[PIXMAN_OP_DISJOINT_IN_REVERSE] = mmx_combine_disjoint_in_reverse_ca;
+    imp->combine_32_ca[PIXMAN_OP_DISJOINT_OUT] = mmx_combine_disjoint_out_ca;
+    imp->combine_32_ca[PIXMAN_OP_DISJOINT_OUT_REVERSE] = mmx_combine_disjoint_out_reverse_ca;
+    imp->combine_32_ca[PIXMAN_OP_DISJOINT_ATOP] = mmx_combine_disjoint_atop_ca;
+    imp->combine_32_ca[PIXMAN_OP_DISJOINT_ATOP_REVERSE] = mmx_combine_disjoint_atop_reverse_ca;
+    imp->combine_32_ca[PIXMAN_OP_DISJOINT_XOR] = mmx_combine_disjoint_xor_ca;
+
+    /* Conjoint CA */
+    imp->combine_32_ca[PIXMAN_OP_CONJOINT_OVER] = mmx_combine_conjoint_over_ca;
+    imp->combine_32_ca[PIXMAN_OP_CONJOINT_OVER_REVERSE] = mmx_combine_conjoint_over_reverse_ca;
+    imp->combine_32_ca[PIXMAN_OP_CONJOINT_IN] = mmx_combine_conjoint_in_ca;
+    imp->combine_32_ca[PIXMAN_OP_CONJOINT_IN_REVERSE] = mmx_combine_conjoint_in_reverse_ca;
+    imp->combine_32_ca[PIXMAN_OP_CONJOINT_OUT] = mmx_combine_conjoint_out_ca;
+    imp->combine_32_ca[PIXMAN_OP_CONJOINT_OUT_REVERSE] = mmx_combine_conjoint_out_reverse_ca;
+    imp->combine_32_ca[PIXMAN_OP_CONJOINT_ATOP] = mmx_combine_conjoint_atop_ca;
+    imp->combine_32_ca[PIXMAN_OP_CONJOINT_ATOP_REVERSE] = mmx_combine_conjoint_atop_reverse_ca;
+    imp->combine_32_ca[PIXMAN_OP_CONJOINT_XOR] = mmx_combine_conjoint_xor_ca;
 
     imp->blt = mmx_blt;
     imp->fill = mmx_fill;
