@@ -14,6 +14,12 @@
 #define RB_ONE_HALF 0x800080
 #define RB_MASK_PLUS_ONE 0x10000100
 
+#define RGB_MASK 0xffffff
+#define RGB_DMASK 0xffffffffffffULL
+#define R_DMASK 0x0000ffff00000000ULL
+#define G_DMASK 0x00000000ffff0000ULL
+#define B_DMASK 0x000000000000ffffULL
+
 #define ALPHA_8(x) ((x) >> A_SHIFT)
 #define RED_8(x) (((x) >> R_SHIFT) & MASK)
 #define GREEN_8(x) (((x) >> G_SHIFT) & MASK)

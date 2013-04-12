@@ -4774,6 +4774,336 @@ mmx_src_iter_init (pixman_implementation_t *imp, pixman_iter_t *iter)
     return FALSE;
 }
 
+#define MMX_PDF_SEPARABLE_BLEND_MODE(name)					\
+static void                             \
+mmx_combine_ ## name ## _u (pixman_implementation_t *imp,       \
+			                pixman_op_t              op,        \
+			                uint32_t *                dest,     \
+			                const uint32_t *          src,      \
+			                const uint32_t *          mask,     \
+			                int                      width)     \
+{										\
+	int i;								\
+	for (i = 0; i < width; ++i) {		\
+		__m64 s = load8888(src + i);	\
+		__m64 d = load8888(dest + i);	\
+		__m64 da = expand_alpha(d);		\
+		\
+		if(mask)\
+		{\
+			__m64 m = load8888(mask + i);\
+			__m64 ma = expand_alpha(m);\
+			s = pix_multiply(s,ma);\
+		}\
+		__m64 sa = expand_alpha(s);\
+		\
+		__m64 isa = negate(sa);			\
+		__m64 ida = negate(da);			\
+		\
+		uint32_t result,sada,res;		\
+		\
+		store8888(&result,pix_add_mul(d,isa,s,ida));	\
+		store8888(&sada,pix_multiply(sa,da));			\
+		store8888(&res,mmx_blend_ ## name(d,da,s,sa));	\
+		\
+	    *(dest + i) = result + (sada & A_MASK) + (res & RGB_MASK);	\
+	}	\
+}\
+static void													\
+mmx_combine_ ## name ## _ca (pixman_implementation_t *imp,		\
+			     pixman_op_t              op,				\
+                 uint32_t *                dest,			\
+			     const uint32_t *          src,				\
+			     const uint32_t *          mask,			\
+			     int                     width)				\
+    {														\
+	int i;													\
+	for (i = 0; i < width; ++i) {							\
+		__m64 m = load8888(mask + i);		\
+		__m64 s = load8888(src + i);		\
+		__m64 d = load8888(dest + i);		\
+		__m64 sa = expand_alpha(s);			\
+		__m64 da = expand_alpha(d);			\
+		__m64 ida = negate(da);				\
+		\
+		s = pix_multiply(s,m);				\
+		m = pix_multiply(m,sa);				\
+		__m64 im = negate(m);				\
+		__m64 ima = expand_alpha(m);		\
+        \
+		uint32_t result,mada,res;			\
+	    \
+		store8888(&result,pix_add_mul(d,im,s,ida));					\
+		store8888(&mada,pix_multiply(ima,da));						\
+		store8888(&res,mmx_blend_ ## name(d,da,s,m));					\
+        \
+		*(dest + i) = result + (mada & A_MASK) + (res & RGB_MASK);	\
+	}\
+}
+
+static inline __m64
+_emulate_pminuh(__m64 s, __m64 d)
+{
+	uint64_t tmp_s = to_uint64(s);
+	uint64_t tmp_d = to_uint64(d);
+
+	__m64 res = to_m64(MIN((tmp_s & R_DMASK), (tmp_d & R_DMASK)) 
+		| MIN((tmp_s & G_DMASK), (tmp_d & G_DMASK)) 
+		| MIN((tmp_s & B_DMASK), (tmp_d & B_DMASK)));	
+
+	return res; 
+}
+
+static inline __m64
+_emulate_pmaxuh(__m64 s, __m64 d)
+{
+	uint64_t tmp_s = to_uint64(s);
+	uint64_t tmp_d = to_uint64(d);
+
+	__m64 res = to_m64(MAX((tmp_s & R_DMASK), (tmp_d & R_DMASK)) 
+		| MAX((tmp_s & G_DMASK), (tmp_d & G_DMASK)) 
+		| MAX((tmp_s & B_DMASK), (tmp_d & B_DMASK)));	
+
+	return res; 
+}
+
+#define R_GREATER(a, b) ((a > b) ? 0x0000ffff00000000ULL : 0)
+#define G_GREATER(a, b) ((a > b) ? 0x00000000ffff0000ULL : 0)
+#define B_GREATER(a, b) ((a > b) ? 0x000000000000ffffULL : 0)
+
+static inline __m64
+_emulate_pcmpgtuh(__m64 s, __m64 d)
+{
+	uint64_t tmp_s = to_uint64(s);
+	uint64_t tmp_d = to_uint64(d);
+
+	__m64 res = to_m64(R_GREATER((tmp_s & R_DMASK), (tmp_d & R_DMASK)) 
+		| G_GREATER((tmp_s & G_DMASK), (tmp_d & G_DMASK)) 
+		| B_GREATER((tmp_s & B_DMASK), (tmp_d & B_DMASK)));	
+
+	return res; 
+}
+
+static inline __m64
+_emulate_paddcmpgtuh(__m64 s, __m64 d1, __m64 d2)
+{
+	uint64_t tmp_s = to_uint64(s);
+	uint64_t tmp_d1 = to_uint64(d1);
+	uint64_t tmp_d2 = to_uint64(d2);
+
+	__m64 res = to_m64(R_GREATER((tmp_s & R_DMASK), (tmp_d1 & R_DMASK) + (tmp_d2 & R_DMASK)) 
+		| G_GREATER((tmp_s & G_DMASK), (tmp_d1 & G_DMASK) + (tmp_d2 & G_DMASK)) 
+		| B_GREATER((tmp_s & B_DMASK), (tmp_d1 & B_DMASK) + (tmp_d2 & B_DMASK)));	
+
+	return res; 
+}
+
+
+/*
+ * Screen
+ * B(Dca, ad, Sca, as) = Dca.sa + Sca.da - Dca.Sca
+ */
+static inline __m64
+mmx_blend_screen (__m64 dca, __m64 da, __m64 sca, __m64 sa)
+{
+	__m64 scada = _mm_mullo_pi16(sca,da);
+	__m64 dcasa = _mm_mullo_pi16(dca,sa);
+	__m64 scadca = _mm_mullo_pi16(sca,dca);
+	__m64 res1 = _mm_add_pi16(scada,dcasa);
+	__m64 res = _mm_sub_pi16(res1,scadca);
+	__m64 rcmp, tmp;
+
+	res = _mm_adds_pu16(res1,MC(4x0080));
+	res = _mm_mulhi_pu16(res,MC(4x0101));
+
+
+	rcmp = _emulate_paddcmpgtuh(scadca, scada, dcasa);
+	tmp = _mm_and_si64(rcmp, MC(4x0101));
+	res = _mm_sub_pi16(res, tmp);
+
+	return res;
+}
+
+MMX_PDF_SEPARABLE_BLEND_MODE (screen)
+
+/*
+ * Overlay
+ * B(Dca, Da, Sca, Sa) =
+ *   if 2.Dca < Da
+ *     2.Sca.Dca
+ *   otherwise
+ *     Sa.Da - 2.(Da - Dca).(Sa - Sca)
+ */
+static inline __m64
+mmx_blend_overlay (__m64 dca, __m64 da, __m64 sca, __m64 sa)
+{
+	__m64 res,ires,rcmp,multiplier = 2;
+	multiplier = _mm_shuffle_pi16(multiplier,_MM_SHUFFLE(0,0,0,0));
+
+	res = _mm_mullo_pi16(dca,multiplier);
+	rcmp = _mm_and_si64(_mm_cmpgt_pi16(da,res),RGB_DMASK);
+	res = _mm_mullo_pi16(res,sca);
+
+	if(rcmp != RGB_DMASK)
+	{
+		__m64 dd = _mm_sub_pi16(da,dca);
+		__m64 ss = _mm_sub_pi16(sa,sca);
+		dd = _mm_mullo_pi16(multiplier,dd);
+		ss = _mm_mullo_pi16(dd,ss);
+
+		ires = _mm_mullo_pi16(sa,da);
+		ires = _mm_sub_pi16(ires,ss);
+
+		res = _mm_or_si64(_mm_and_si64(rcmp,res),_mm_andn_si64(rcmp,ires));
+	}
+
+	res = _mm_adds_pu16(res,MC(4x0080));
+	res = _mm_mulhi_pu16(res,MC(4x0101));
+
+	return res;
+}
+
+MMX_PDF_SEPARABLE_BLEND_MODE (overlay)
+
+/*
+ * Darken
+ * B(Dca, Da, Sca, Sa) = min (Sca.Da, Dca.Sa)
+ */
+static inline __m64
+mmx_blend_darken (__m64 dca, __m64 da, __m64 sca, __m64 sa)
+{
+	__m64 res;
+
+	__m64 s = _mm_mullo_pi16(sca,da);
+	__m64 d = _mm_mullo_pi16(dca,sa);
+
+	//rcmp = _mm_cmpgt_pi16(s,d);
+	//res = _mm_or_si64(_mm_and_si64(rcmp,d),_mm_andn_si64(rcmp,s));
+
+	res = _emulate_pminuh(s, d);
+	res = _mm_adds_pu16(res,MC(4x0080));
+	res = _mm_mulhi_pu16(res,MC(4x0101));
+	
+	return res;
+}
+
+MMX_PDF_SEPARABLE_BLEND_MODE (darken)
+
+/*
+ * Lighten
+ * B(Dca, Da, Sca, Sa) = max (Sca.Da, Dca.Sa)
+ */
+static inline __m64
+mmx_blend_lighten (__m64 dca, __m64 da, __m64 sca, __m64 sa)
+{
+	__m64 res;
+
+	__m64 s = _mm_mullo_pi16(sca,da);
+	__m64 d = _mm_mullo_pi16(dca,sa);
+
+	//rcmp = _mm_cmpgt_pi16(s,d);
+	//res = _mm_or_si64(_mm_and_si64(rcmp,s),_mm_andn_si64(rcmp,d));
+	//
+	res = _emulate_pmaxuh(s, d);
+	res = _mm_adds_pu16(res,MC(4x0080));
+	res = _mm_mulhi_pu16(res,MC(4x0101));
+	
+	return res;
+}
+
+MMX_PDF_SEPARABLE_BLEND_MODE (lighten)
+
+/*
+ * Hard light
+ * B(Dca, Da, Sca, Sa) =
+ *   if 2.Sca < Sa
+ *     2.Sca.Dca
+ *   otherwise
+ *     Sa.Da - 2.(Da - Dca).(Sa - Sca)
+ */
+static inline __m64
+mmx_blend_hard_light (__m64 dca, __m64 da, __m64 sca, __m64 sa)
+{
+	__m64 res,ires,rcmp,multiplier = 2;
+	multiplier = _mm_shuffle_pi16(multiplier,_MM_SHUFFLE(0,0,0,0));
+
+	res = _mm_mullo_pi16(sca,multiplier);
+	rcmp = _mm_and_si64(_mm_cmpgt_pi16(sa,res),RGB_DMASK);
+	res = _mm_mullo_pi16(res,dca);
+
+	if(rcmp != RGB_DMASK)
+	{
+		__m64 dd = _mm_sub_pi16(da,dca);
+		__m64 ss = _mm_sub_pi16(sa,sca);
+		dd = _mm_mullo_pi16(multiplier,dd);
+		ss = _mm_mullo_pi16(dd,ss);
+
+		ires = _mm_mullo_pi16(sa,da);
+		ires = _mm_sub_pi16(ires,ss);
+
+		res = _mm_or_si64(_mm_and_si64(rcmp,res),_mm_andn_si64(rcmp,ires));
+	}
+
+	res = _mm_adds_pu16(res,MC(4x0080));
+	res = _mm_mulhi_pu16(res,MC(4x0101));
+
+	return res;
+}
+
+MMX_PDF_SEPARABLE_BLEND_MODE (hard_light)
+
+/*
+ * Difference
+ * B(Dca, Da, Sca, Sa) = abs (Dca.Sa - Sca.Da)
+ */
+static inline __m64
+mmx_blend_difference (__m64 dca, __m64 da, __m64 sca, __m64 sa)
+{
+	__m64 res,ires,rcmp;
+	__m64 dcasa = _mm_mullo_pi16(dca,sa);
+	__m64 scada = _mm_mullo_pi16(sca,da);
+
+	//rcmp = _mm_cmpgt_pi16(scada,dcasa);
+	
+	rcmp = _emulate_pcmpgtuh(scada, dcasa);
+	
+	res = _mm_sub_pi16(scada,dcasa);
+	ires = _mm_sub_pi16(dcasa,scada);
+
+	res = _mm_or_si64(_mm_and_si64(rcmp,res),_mm_andn_si64(rcmp,ires));
+	res = _mm_adds_pu16(res,MC(4x0080));
+	res = _mm_mulhi_pu16(res,MC(4x0101));
+
+	return res;
+}
+
+MMX_PDF_SEPARABLE_BLEND_MODE (difference)
+
+/*
+ * Exclusion
+ * B(Dca, Da, Sca, Sa) = (Sca.Da + Dca.Sa - 2.Sca.Dca)
+ */
+/* This can be made faster by writing it directly and not using
+ * PDF_SEPARABLE_BLEND_MODE, but that's a performance optimization */
+static inline __m64
+mmx_blend_exclusion (__m64 dca, __m64 da, __m64 sca, __m64 sa)
+{
+	__m64 res,tmp;
+	res = _mm_add_pi16(_mm_mullo_pi16(sca,da),_mm_mullo_pi16(dca,sa));
+	tmp = _mm_mullo_pi16(_mm_slli_pi16(dca,1),sca);
+	
+	res = _mm_sub_pi16(res,tmp);
+	res = _mm_adds_pu16(res,MC(4x0080));
+	res = _mm_mulhi_pu16(res,MC(4x0101));
+
+	return res;
+
+}
+
+MMX_PDF_SEPARABLE_BLEND_MODE (exclusion)
+
+#undef MMX_PDF_SEPARABLE_BLEND_MODE
+
 static const pixman_fast_path_t mmx_fast_paths[] =
 {
     PIXMAN_STD_FAST_PATH    (OVER, solid,    a8,       r5g6b5,   mmx_composite_over_n_8_0565       ),
@@ -4911,6 +5241,14 @@ _pixman_implementation_create_mmx (pixman_implementation_t *fallback)
     
 	/* Multiply, Unified */
 	imp->combine_32[PIXMAN_OP_MULTIPLY] = mmx_combine_multiply_u;
+	//imp->combine_32[PIXMAN_OP_SCREEN] = mmx_combine_screen_u;
+    //imp->combine_32[PIXMAN_OP_OVERLAY] = mmx_combine_overlay_u;
+    imp->combine_32[PIXMAN_OP_DARKEN] = mmx_combine_darken_u;
+    imp->combine_32[PIXMAN_OP_LIGHTEN] = mmx_combine_lighten_u;
+    //imp->combine_32[PIXMAN_OP_HARD_LIGHT] = mmx_combine_hard_light_u;
+    imp->combine_32[PIXMAN_OP_DIFFERENCE] = mmx_combine_difference_u;
+    //imp->combine_32[PIXMAN_OP_EXCLUSION] = mmx_combine_exclusion_u;
+
 	
     /* Component alpha combiners */
     imp->combine_32_ca[PIXMAN_OP_SRC] = mmx_combine_src_ca;
@@ -4950,6 +5288,13 @@ _pixman_implementation_create_mmx (pixman_implementation_t *fallback)
 
 	/* Multiply CA */
 	imp->combine_32_ca[PIXMAN_OP_MULTIPLY] = mmx_combine_multiply_ca;
+    //imp->combine_32_ca[PIXMAN_OP_SCREEN] = mmx_combine_screen_ca;
+    //imp->combine_32_ca[PIXMAN_OP_OVERLAY] = mmx_combine_overlay_ca;
+    imp->combine_32_ca[PIXMAN_OP_DARKEN] = mmx_combine_darken_ca;
+    imp->combine_32_ca[PIXMAN_OP_LIGHTEN] = mmx_combine_lighten_ca;
+    //imp->combine_32_ca[PIXMAN_OP_HARD_LIGHT] = mmx_combine_hard_light_ca;
+    imp->combine_32_ca[PIXMAN_OP_DIFFERENCE] = mmx_combine_difference_ca;
+    //imp->combine_32_ca[PIXMAN_OP_EXCLUSION] = mmx_combine_exclusion_ca;
 
     imp->blt = mmx_blt;
     imp->fill = mmx_fill;

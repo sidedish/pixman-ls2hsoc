@@ -89,6 +89,17 @@ _mm_adds_pu8 (__m64 __m1, __m64 __m2)
 }
 
 extern __inline __m64 __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+_mm_andn_si64 (__m64 __m1, __m64 __m2)
+{
+	 __m64 ret;
+	asm("pandn %0, %1, %2\n\t"
+        : "=f" (ret)
+        : "f" (__m1), "f" (__m2)
+    );  
+    return ret;
+}
+
+extern __inline __m64 __attribute__((__gnu_inline__, __always_inline__, __artificial__))
 _mm_and_si64 (__m64 __m1, __m64 __m2)
 {
 	__m64 ret;
@@ -96,6 +107,17 @@ _mm_and_si64 (__m64 __m1, __m64 __m2)
 	   : "=f" (ret)
 	   : "f" (__m1), "f" (__m2)
 	);
+	return ret;
+}
+
+extern __inline __m64 __attribute__((__gnu_inline__, __always_inline__, __artificial__))                        
+_mm_cmpeq_pi16 (__m64 __m1, __m64 __m2)
+{
+    __m64 ret;
+	asm("pcmpeqh %0, %1, %2\n\t"   
+		: "=f" (ret)    
+		: "f" (__m1), "f" (__m2)       
+	); 
 	return ret;
 }
 
@@ -419,3 +441,16 @@ loongson_insert_pi16 (__m64 __m1, __m64 __m2, int64_t __pos)
 	);
 	return ret;
 }
+
+extern __inline __m64 __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+loongson_fand (__m64 __m1, __m64 __m2)
+{
+	__m64 ret;
+	asm("fand %0, %1, %2\n\t"
+	   : "=f" (ret)
+	   : "f" (__m1), "f" (__m2)
+	);
+	return ret;
+}
+
+
