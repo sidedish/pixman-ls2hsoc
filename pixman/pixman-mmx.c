@@ -251,6 +251,8 @@ typedef __m64 mmxdatafield;
 
 typedef struct
 {
+    mmxdatafield mmx_4xffff;
+    mmxdatafield mmx_4xff00;
     mmxdatafield mmx_4x00ff;
     mmxdatafield mmx_4x0080;
     mmxdatafield mmx_565_rgb;
@@ -285,6 +287,8 @@ typedef struct
 
 static const mmx_data_t c =
 {
+    MMXDATA_INIT (.mmx_4xffff,                   0xffffffffffffffff),
+    MMXDATA_INIT (.mmx_4xff00,                   0xff00ff00ff00ff00),
     MMXDATA_INIT (.mmx_4x00ff,                   0x00ff00ff00ff00ff),
     MMXDATA_INIT (.mmx_4x0080,                   0x0080008000800080),
     MMXDATA_INIT (.mmx_565_rgb,                  0x000001f0003f001f),
@@ -1473,6 +1477,459 @@ mmx_combine_conjoint_xor_u (pixman_implementation_t *imp,
 {
     mmx_combine_conjoint_general_u (dest, src, mask, width, COMBINE_XOR);
 }
+
+/* 要注意优化前计算中A的计算方式与RGB不同 */
+#define MMX_PDF_SEPARABLE_BLEND_MODE(name)				\
+    static void								\
+    mmx_combine_ ## name ## _u (pixman_implementation_t *imp,		\
+				pixman_op_t              op,		\
+				uint32_t *                dest,		\
+				const uint32_t *          src,		\
+				const uint32_t *          mask,		\
+				int                      width)		\
+    {									\
+        uint32_t *end = dest + width;					\
+									\
+	while (dest < end)						\
+	    {								\
+		__m64 s64 = combine (src, mask);			\
+		__m64 d64 = load8888 (dest);				\
+		__m64 sa64 = expand_alpha (s64);			\
+		__m64 isa64 = _mm_xor_si64 (sa64, MC (4x00ff));		\
+		__m64 da64 = expand_alpha (d64);			\
+		__m64 ida64 = _mm_xor_si64 (da64, MC (4x00ff));		\
+		__m64 res;						\
+		uint32_t result;					\
+		store8888 (&result, pix_add_mul (d64,isa64,s64,ida64));	\
+									\
+		res = mmx_blend_ ## name (d64, da64, s64, sa64);	\
+		*dest = result;						\
+		*dest += (uint32_t)(to_uint64 (loongson_extract_pi16 (res, 0))); \
+		*dest += ((uint32_t)(to_uint64 (loongson_extract_pi16 (res, 1)))) << G_SHIFT; \
+		*dest += ((uint32_t)(to_uint64 (loongson_extract_pi16 (res, 2)))) << R_SHIFT; \
+		*dest += ((uint32_t)(to_uint64 (loongson_extract_pi16 (res, 3)))) << A_SHIFT; \
+									\
+		++dest;							\
+		++src;							\
+		if (mask)						\
+		    ++mask;						\
+	    }								\
+    }									\
+									\
+    static void								\
+    mmx_combine_ ## name ## _ca (pixman_implementation_t *imp,		\
+				 pixman_op_t              op,		\
+				 uint32_t *                dest,	\
+				 const uint32_t *          src,		\
+				 const uint32_t *          mask,	\
+				 int                     width)		\
+    {									\
+        uint32_t *end = dest + width;					\
+									\
+	while (dest < end)						\
+	    {								\
+		__m64 d64 = load8888 (dest);				\
+		__m64 da64 = expand_alpha (d64);			\
+		__m64 ida64 = _mm_xor_si64 (da64, MC (4x00ff));		\
+		__m64 s64, m64, im64, res;				\
+		uint32_t result;					\
+		mmx_combine_mask_ca (src, mask, &s64, &m64);		\
+		im64 = _mm_xor_si64 (m64, MC (4x00ff));			\
+									\
+		store8888 (&result, pix_add_mul (d64,im64,s64,ida64));	\
+									\
+		res = mmx_blend_ ## name (d64, da64, s64, m64);		\
+		*dest = result;						\
+		*dest += (uint32_t)(to_uint64 (loongson_extract_pi16 (res, 0))); \
+		*dest += ((uint32_t)(to_uint64 (loongson_extract_pi16 (res, 1)))) << G_SHIFT; \
+		*dest += ((uint32_t)(to_uint64 (loongson_extract_pi16 (res, 2)))) << R_SHIFT; \
+		*dest += ((uint32_t)(to_uint64 (loongson_extract_pi16 (res, 3)))) << A_SHIFT; \
+									\
+		++dest;							\
+		++src;							\
+		if (mask)						\
+		    ++mask;						\
+	    }								\
+    }		
+
+/* DIV_ONE_UN8 */
+static inline __m64
+mmx_div_one_un8 (__m64 x)
+{
+    __m64 res;			     
+    res = _mm_adds_pu16 (x, MC(4x0080));
+    res = _mm_mulhi_pu16 (res, MC(4x0101));
+
+    return res;
+}
+
+/* DIV_ONE_UN8 (x + y + z); */
+/* 等价于 */
+/* uint32_t hi = (x>>8) + (y>>8) + (z>>8); */
+/* uint32_t lo = (x&0xff) + (y&0xff) + (z&0xff) + ONE_HALF; */
+/* uint32_t res = hi + (lo>>8) + ((hi + (lo>>8) + (lo&0xff))>>8); */
+/* 减法相当于加上其补码，需要注意移位时负数补1，其它补0 */
+static inline __m64
+mmx_div_one_un8_3p (__m64 x, __m64 y, __m64 z, __m64 cmpfy, __m64 cmpfz)
+{
+    __m64 hi = _mm_srli_pi16 (y, G_SHIFT);
+    cmpfy = _mm_and_si64 (cmpfy, MC (4xff00));
+    hi = _mm_add_pi16 (_mm_srli_pi16 (x, G_SHIFT), _mm_xor_si64 (hi, cmpfy));
+    
+    __m64 tmp = _mm_srli_pi16 (z, G_SHIFT);
+    cmpfz =  _mm_and_si64 (cmpfz, MC (4xff00));
+    hi = _mm_add_pi16 (hi, _mm_xor_si64(tmp, cmpfz));
+
+    __m64 lo = _mm_add_pi16 (_mm_and_si64 (x, MC(4x00ff)),
+			     _mm_and_si64 (y, MC(4x00ff)));
+    tmp = _mm_add_pi16 (_mm_and_si64(z, MC (4x00ff)), MC (4x0080));
+    lo = _mm_add_pi16 (lo, tmp);
+
+    __m64 res = _mm_add_pi16 (hi, _mm_srli_pi16 (lo, G_SHIFT));
+    
+    tmp = _mm_add_pi16 (res, _mm_and_si64 (lo, MC (4x00ff)));
+    __m64 cmpf = _mm_cmpgt_pi16 (0, tmp);
+    tmp = _mm_srli_pi16 (tmp, G_SHIFT);
+    cmpf = _mm_and_si64 (cmpf, MC (4xff00));
+    tmp = _mm_xor_si64 (tmp, cmpf);
+    res = _mm_add_pi16 (res, tmp);
+
+    return res;
+}
+
+/* 根据cmpf标记从x中抽取cmpf中为1的位与从y中抽取为0的位组合成新的参数 */
+static inline __m64
+mmx_construct_with_cmpf (__m64 x, __m64 y, __m64 cmpf)
+{
+    __m64 neg_cmpf = _mm_xor_si64 (cmpf, MC (4xffff));
+    __m64 res = _mm_or_si64 (_mm_and_si64 (x, cmpf),
+			     _mm_and_si64 (y, neg_cmpf));
+    return res;
+
+}
+    
+/* DIV_ONE_UN8 (sca * da + dca * sa - sca * dca); */
+static inline __m64
+mmx_blend_screen (__m64 dca, __m64 da, __m64 sca, __m64 sa)
+{
+    __m64 sca_da = _mm_mullo_pi16 (sca, da);
+    
+    /* A的计算方式与RGB的方式不同，所以这里需要保证mmx_div_one_un8_3p */
+    /*第一个参数的高16位等于da*sa, 第二、三个参数的高16位为0 */
+    dca = loongson_insert_pi16 (dca, 0x0, 3); /* 置0后dca_sa和sca_dca的最高16位将为0 */
+    __m64 dca_sa = _mm_mullo_pi16 (dca, sa);
+    __m64 sca_dca = _mm_mullo_pi16 (sca, dca);
+
+    /* 控制mmx_div_one_un8_3p中移位后高位补位, 0被0，负数补1 */
+    __m64 cmpf = _mm_cmpeq_pi16 (sca_dca, 0x0);
+    cmpf = _mm_xor_si64 (cmpf, MC (4xffff));
+    
+    sca_dca = _mm_sub_pi16 (0x0, sca_dca); /* 此项肯定为负，因此取其补码 */
+
+    return mmx_div_one_un8_3p (sca_da, dca_sa, sca_dca, 0x0, cmpf);
+}
+
+MMX_PDF_SEPARABLE_BLEND_MODE (screen)
+
+/* if (2 * dca < da) */
+/*     rca = 2 * sca * dca; */
+/* 等价于： sca * dca + sca * dca + 0 */
+/*  else */
+/*      rca = sa * da - 2 * (da - dca) * (sa - sca); */
+/* 等价于：  rca = sa * da +  (dca - da) * (sa - sca) +  (dca - da) * (sa - sca); */
+static inline __m64
+mmx_blend_overlay (__m64 dca, __m64 da, __m64 sca, __m64 sa)
+{
+
+    /* 分支标记 (2*dca < da) 1->if 0->else*/
+    __m64 cmpf_2dca_da = _mm_cmpgt_pi16 (da, _mm_slli_si64 (dca, 1)); 
+
+    /* if 分支 */
+    /* sa*da 的计算方式与RGB不同，需要将mmx_div_one_un8_3p的第一个参数的最高16位 */
+    /* 设置为sa*da的结果，第二和第三个参数的最高16位设置为0。*/
+    /* 由于if分支中的第一个参数是sca*dca，else分支中的第一个参数是sa * da，正好是所 */
+    /* 需要的sa*da。因此无论走哪个分支，A都不用额外处理 */
+    __m64 sca_dca = _mm_mullo_pi16 (sca, dca);
+
+    /* else 分支 */
+    __m64 sa_da = _mm_mullo_pi16 (sa, da); 
+
+    /* 计算(dca - da)由于减法可能导致负数，负数则是用补码表示，因此要记录符号 */
+    /* 注意：这里dca和da实际上只有8位，如果其实际有16位，则下面的做法可能导致错误 */
+    /* 因为比较是带符号的比较 */
+    __m64 dca_da = _mm_sub_pi16 (dca, da);
+    __m64 cmpf_dca_da = _mm_cmpgt_pi16 (0x0, dca_da); /*1->negative 0->positive and 0*/
+
+    /* 计算sa - sca */
+    __m64 sa_sca = _mm_sub_pi16 (sa, sca);
+    __m64 cmpf_sa_sca = _mm_cmpgt_pi16 (0x0, sa_sca);
+    
+    __m64 ddss = _mm_mullo_pi16 (dca_da, sa_sca);	     /* （dca - da) * (sa - sca) */
+    __m64 cmpf_ddss = _mm_xor_si64 (_mm_cmpeq_pi16 (0x0, ddss), MC (4xffff)); /* 是否为0 */
+    cmpf_ddss = _mm_and_si64 (cmpf_ddss, _mm_xor_si64 (cmpf_dca_da, cmpf_sa_sca));/* （dca - da) * (sa - sca)的符号，1=>负 0=>0或正*/
+
+    /* 构造mmx_div_one_un8_3p的三个参数 */
+    __m64 fir = mmx_construct_with_cmpf (sca_dca, sa_da, cmpf_2dca_da);
+    __m64 sec = mmx_construct_with_cmpf (sca_dca, ddss, cmpf_2dca_da);
+    __m64 trd = mmx_construct_with_cmpf (0x0, ddss, cmpf_2dca_da);
+    /* 保证第二、三个参数的最高16位为0 */
+    sec = loongson_insert_pi16 (sec, 0x0, 3);
+    trd = loongson_insert_pi16 (trd, 0x0, 3);
+
+    __m64 cmpf_sec = _mm_and_si64 (_mm_xor_si64 (cmpf_2dca_da, MC (4xffff)),
+				   cmpf_ddss);
+    __m64 cmpf_trd = cmpf_sec;
+    
+    return mmx_div_one_un8_3p (fir, sec, trd, cmpf_sec, cmpf_trd);
+}
+
+MMX_PDF_SEPARABLE_BLEND_MODE (overlay)
+
+/* DIV_ONE_UN8 (s > d ? d : s); loongson多媒体比较指令是比较有符号数，所以这里不能用*/
+/* 等价于s与d做无符号数减法，其结果为0时说明s<=d,否则s>d */
+/* 根据此符号构造出传递给DIV_ONE_UN8的参数 */
+/* 由于sca*da或者dca*sa的最高16位于da*sa的最高16位肯定一样，所以最高16位不用单独处理 */
+static inline __m64
+mmx_blend_darken (__m64 dca, __m64 da, __m64 sca, __m64 sa)
+{
+    __m64 sca_da = _mm_mullo_pi16 (sca, da);
+    __m64 dca_sa = _mm_mullo_pi16 (dca, sa);
+
+    __m64 cmpf = _mm_cmpeq_pi16 (0x0, _mm_sub_pu16 (sca_da, dca_sa));
+
+    sca_da = mmx_construct_with_cmpf (sca_da, dca_sa, cmpf);
+    
+    return mmx_div_one_un8 (sca_da);
+}
+
+MMX_PDF_SEPARABLE_BLEND_MODE (darken)
+
+/* DIV_ONE_UN8 (s > d ? s : d); loongson多媒体比较指令是比较有符号数，所以这里不能用*/
+/* 等价于s与d做无符号数减法，其结果为0时说明s<=d,否则s>d */
+/* 根据此符号构造出传递给DIV_ONE_UN8的参数 */
+/* 由于sca*da或者dca*sa的最高16位于da*sa的最高16位肯定一样，所以最高16位不用单独处理 */
+static inline __m64
+mmx_blend_lighten (__m64 dca, __m64 da, __m64 sca, __m64 sa)
+{
+    __m64 sca_da = _mm_mullo_pi16 (sca, da);
+    __m64 dca_sa = _mm_mullo_pi16 (dca, sa);
+
+    __m64 cmpf = _mm_cmpeq_pi16 (0x0, _mm_sub_pu16 (sca_da, dca_sa));
+
+    sca_da = mmx_construct_with_cmpf (dca_sa, sca_da, cmpf);
+    
+    return mmx_div_one_un8 (sca_da);
+}
+
+MMX_PDF_SEPARABLE_BLEND_MODE (lighten)
+
+/* 原式中两个分支最终的结果都是sa * x的形式，所以只要组合好x就可以了。 */
+/* 最后再来做乘法 */
+static inline __m64
+mmx_blend_color_dodge (__m64 dca, __m64 da, __m64 sca, __m64 sa)
+{
+    uint8_t da8 = to_uint64 (da) & MASK;
+    if (da8 == 0)
+        return 0;
+
+    /* cmpare flag */
+    __m64 sa_sub_sca = _mm_sub_pu16 (sa, sca);
+    __m64 cmpf_sca_sa = _mm_cmpeq_pi16 (0x0, sa_sub_sca); /* 1=>if 0=>else */
+
+    /* if分支不用管 */
+    __m64 cmpf_dca_0 = _mm_cmpeq_pi16 (0x0, dca);
+    da = _mm_and_si64 (da, _mm_xor_si64 (cmpf_dca_0, MC (4xffff)));
+    cmpf_sca_sa = _mm_or_si64 (cmpf_sca_sa, cmpf_dca_0);
+
+    /* else */
+    __m64 dca_sa = _mm_mullo_pi16 (dca, sa);
+    __m64 sa_sca = _mm_sub_pi16 (sa, sca);
+    __m64 divident, divisor;
+    uint32_t i;
+
+    for (i=0; i<3; i++)
+        {
+            /* dca 为0，sa * MIN(rca, da)必为0，因为rca=dca*sa/(sa-sca) */
+            if (!_mm_cmpeq_pi16 (loongson_extract_pi16 (dca, i), 0x0))
+                {
+                    dca_sa = loongson_insert_pi16 (dca_sa, 0x0, i);
+                    continue;
+                }
+
+            divident = loongson_extract_pi16 (sa_sca, i);
+            if (_mm_cmpgt_pi16 (divident, 0x0))
+                {
+                    divisor = loongson_extract_pi16 (dca_sa, i);
+                    uint32_t end = (uint32_t)(to_uint64 (divisor)) / (uint32_t)(to_uint64 (divident));
+                    if (end > da8)
+                        {
+			    dca_sa = loongson_insert_pi16 (dca_sa,
+							   loongson_extract_pi16 (da,i),
+							   i);
+                        }
+                    else
+                        {
+                            uint64_t end64 = end;
+			    dca_sa = loongson_insert_pi16 (dca_sa,
+							   to_m64 (end64),
+							   i);
+                        }
+                }
+        }
+    /* 组合sa * x中的x */
+    __m64 sa_da = mmx_construct_with_cmpf (da, dca_sa, cmpf_sca_sa);
+    sa_da = _mm_mullo_pi16 (sa, sa_da);
+
+    return mmx_div_one_un8 (sa_da);
+}
+
+MMX_PDF_SEPARABLE_BLEND_MODE (color_dodge)
+
+/* 按照优化前函数注释分析发现else分支返回值可修改为：*/
+/* return  DIV_ONE_UN8 (sa * (da - MIN (da, rca))); */
+/* 原式中有MAX，而当da小于dca时，其差值将为一个非常大的数 */
+/* 从而无法用16位表示，也就无法使用多媒体指令来优化了 */
+static inline __m64
+mmx_blend_color_burn (__m64 dca, __m64 da, __m64 sca, __m64 sa)
+{
+    /* 确定分支 1=>if 0=>else*/
+    __m64 cmpf_sca_0 = _mm_cmpeq_pi16 (sca , 0);
+    /* sa为0时，两个分支的计算结果都将为0，因此让其走第一个分支，避免复杂的计算 */
+    /*  */
+    __m64 cmpf_sa_0 = _mm_cmpeq_pi16 (sa, 0);
+    cmpf_sca_0 = _mm_or_si64 (cmpf_sca_0, cmpf_sa_0);
+    /* 处理最高16位,让其走第一个分支，保证计算结果为sa*da*/
+    /*由于dca的最高位与da相等，因此if分支中的小于不成立，肯定走sa*da */
+    cmpf_sca_0 = loongson_insert_pi16 (cmpf_sca_0, MC (4xffff), 3);
+    
+    /* if分支 */
+    __m64 cmpf_dca_da = _mm_cmpgt_pi16 (da, dca);
+    __m64 if_da = _mm_and_si64 (da, _mm_xor_si64 (cmpf_dca_da, MC (4xffff)));
+
+    /* else分支 */
+    __m64 da_dca = _mm_sub_pi16 (da, dca);
+    __m64 rca = _mm_mullo_pi16 (da_dca, sa);
+    __m64 divident, divisor;
+    uint32_t i;
+
+    for (i=0; i<3; i++)
+        {
+            if (!loongson_extract_pi16 (cmpf_sca_0, i))
+                {
+		    divisor = loongson_extract_pi16 (rca, i);
+		    divident = loongson_extract_pi16 (sca, i);
+	    
+		    uint32_t end = (uint32_t)(to_uint64 (divisor)) / (uint32_t)(to_uint64 (divident));
+		    uint64_t end64 = end;
+		    rca = loongson_insert_pi16 (rca, to_m64 (end64), i);
+		}
+        }
+    /* 求rca与da的最小值 */
+    __m64 cmpf_else = _mm_cmpgt_pi16 (_mm_sub_pi16 (rca, da), 0);
+    __m64 else_da = mmx_construct_with_cmpf (da, rca, cmpf_else);
+
+    else_da = _mm_sub_pu16 (da, else_da);
+
+    __m64 sa_da = mmx_construct_with_cmpf (if_da, else_da, cmpf_sca_0);
+
+    sa_da = _mm_mullo_pi16 (sa, sa_da);
+
+    return mmx_div_one_un8 (sa_da);
+}
+
+MMX_PDF_SEPARABLE_BLEND_MODE (color_burn)
+
+static inline __m64
+mmx_blend_hard_light (__m64 dca, __m64 da, __m64 sca, __m64 sa)
+{
+
+    /* 分支标记 (2*dca < da) 1->if 0->else*/
+    __m64 cmpf_2dca_da = _mm_cmpgt_pi16 (sa, _mm_slli_si64 (sca,1)); 
+
+    /* if 分支 */
+    /* sa*da 的计算方式与RGB不同，需要将mmx_div_one_un8_3p的第一个参数的最高16位 */
+    /* 设置为sa*da的结果，第二和第三个参数的最高16位设置为0。*/
+    /* 由于if分支中的第一个参数是sca*dca，else分支中的第一个参数是sa * da，正好是所 */
+    /* 需要的sa*da。因此无论走哪个分支，A都不用额外处理 */
+    __m64 sca_dca = _mm_mullo_pi16 (sca, dca);
+
+    /* else 分支 */
+    __m64 sa_da = _mm_mullo_pi16 (sa, da); 
+
+    /* 计算(dca - da)由于减法可能导致负数，负数则是用补码表示，因此要记录符号 */
+    /* 注意：这里dca和da实际上只有8位，如果其实际有16位，则下面的做法可能导致错误 */
+    /* 因为比较是带符号的比较 */
+    __m64 dca_da = _mm_sub_pi16 (dca, da);
+    __m64 cmpf_dca_da = _mm_cmpgt_pi16 (0x0, dca_da); /*1->negative 0->positive and 0*/
+
+    /* 计算sa - sca */
+    __m64 sa_sca = _mm_sub_pi16 (sa, sca);
+    __m64 cmpf_sa_sca = _mm_cmpgt_pi16 (0x0, sa_sca);
+    
+    __m64 ddss = _mm_mullo_pi16 (dca_da, sa_sca);	     /* （dca - da) * (sa - sca)的值 */
+    __m64 cmpf_ddss = _mm_xor_si64 (_mm_cmpeq_pi16 (0x0, ddss), MC (4xffff));
+    cmpf_ddss = _mm_and_si64 (cmpf_ddss, _mm_xor_si64 (cmpf_dca_da, cmpf_sa_sca));/* （dca - da) * (sa - sca)的符号，1=>负 0=>0或正 */
+
+    __m64 fir = mmx_construct_with_cmpf (sca_dca, sa_da, cmpf_2dca_da);
+    __m64 sec = mmx_construct_with_cmpf (sca_dca, ddss, cmpf_2dca_da);
+    __m64 trd = mmx_construct_with_cmpf (0x0, ddss, cmpf_2dca_da);
+    /* 保证第二、三个参数的最高16位为0 */
+    sec = loongson_insert_pi16 (sec, 0x0, 3);
+    trd = loongson_insert_pi16 (trd, 0x0, 3);
+    __m64 cmpf_sec = _mm_and_si64 (_mm_xor_si64 (cmpf_2dca_da, MC  (4xffff)), cmpf_ddss);
+    __m64 cmpf_trd = cmpf_sec;
+    
+    return mmx_div_one_un8_3p (fir, sec, trd, cmpf_sec, cmpf_trd);
+}
+
+MMX_PDF_SEPARABLE_BLEND_MODE (hard_light)
+
+static inline __m64
+mmx_blend_difference (__m64 dca, __m64 da, __m64 sca, __m64 sa)
+{
+    __m64 dca_sa = _mm_mullo_pi16 (dca, sa);
+    __m64 sca_da = _mm_mullo_pi16 (sca, da);
+
+    __m64 cmpf = _mm_sub_pu16 (dca_sa, sca_da); 
+    cmpf = _mm_cmpeq_pi16 (0x0, cmpf); /* 0=>if 1=>else */
+
+    __m64 fir = mmx_construct_with_cmpf (sca_da, dca_sa, cmpf);
+    __m64 sec = mmx_construct_with_cmpf (dca_sa, sca_da, cmpf);
+
+    /* 处理最高16位 */
+    sec = loongson_insert_pi16 (sec, 0x0, 3);
+
+    return mmx_div_one_un8 (_mm_sub_pi16 (fir, sec));
+}
+
+MMX_PDF_SEPARABLE_BLEND_MODE (difference)
+
+/* DIV_ONE_UN8 (sca * da + dca * sa - 2 * dca * sca); */
+/* 等价于DIV_ONE_UN8 (sca * da + dca * (sa - sca)  - dca * sca); */
+/* 从而可以使用mmx_div_one_un8_3p函数 */
+static inline __m64
+mmx_blend_exclusion (__m64 dca, __m64 da, __m64 sca, __m64 sa)
+{
+    __m64 fir = _mm_mullo_pi16 (sca, da);
+
+    /* 用于保证第二、三个参数的高16位为0 */
+    dca = loongson_insert_pi16 (dca, 0x0, 3);
+    
+    __m64 sec = _mm_sub_pi16 (sa, sca);
+    /* 0移位与正数移位都应该补0，负数补1 */
+    __m64 cmpf_sec = _mm_cmpgt_pi16 (0x0, sec); /* 1=>负 0=>正数或0 */
+    sec = _mm_mullo_pi16 (dca, sec);
+    cmpf_sec = _mm_and_si64 (cmpf_sec,
+			     _mm_xor_si64 (_mm_cmpeq_pi16(0x0, sec), MC (4xffff)));
+
+    __m64 trd = _mm_mullo_pi16 (dca, sca);
+    __m64 cmpf_trd = _mm_xor_si64 (_mm_cmpeq_pi16(0x0, trd), MC (4xffff));
+    /* 第三个参数做减法，相当于加上其补码 */
+    trd = _mm_sub_pi16 (0x0, trd); 
+    return mmx_div_one_un8_3p (fir, sec, trd, cmpf_sec, cmpf_trd);
+}
+
+MMX_PDF_SEPARABLE_BLEND_MODE (exclusion)
 
 /* Component alpha combiners */
 static void
@@ -4774,336 +5231,6 @@ mmx_src_iter_init (pixman_implementation_t *imp, pixman_iter_t *iter)
     return FALSE;
 }
 
-#define MMX_PDF_SEPARABLE_BLEND_MODE(name)					\
-static void                             \
-mmx_combine_ ## name ## _u (pixman_implementation_t *imp,       \
-			                pixman_op_t              op,        \
-			                uint32_t *                dest,     \
-			                const uint32_t *          src,      \
-			                const uint32_t *          mask,     \
-			                int                      width)     \
-{										\
-	int i;								\
-	for (i = 0; i < width; ++i) {		\
-		__m64 s = load8888(src + i);	\
-		__m64 d = load8888(dest + i);	\
-		__m64 da = expand_alpha(d);		\
-		\
-		if(mask)\
-		{\
-			__m64 m = load8888(mask + i);\
-			__m64 ma = expand_alpha(m);\
-			s = pix_multiply(s,ma);\
-		}\
-		__m64 sa = expand_alpha(s);\
-		\
-		__m64 isa = negate(sa);			\
-		__m64 ida = negate(da);			\
-		\
-		uint32_t result,sada,res;		\
-		\
-		store8888(&result,pix_add_mul(d,isa,s,ida));	\
-		store8888(&sada,pix_multiply(sa,da));			\
-		store8888(&res,mmx_blend_ ## name(d,da,s,sa));	\
-		\
-	    *(dest + i) = result + (sada & A_MASK) + (res & RGB_MASK);	\
-	}	\
-}\
-static void													\
-mmx_combine_ ## name ## _ca (pixman_implementation_t *imp,		\
-			     pixman_op_t              op,				\
-                 uint32_t *                dest,			\
-			     const uint32_t *          src,				\
-			     const uint32_t *          mask,			\
-			     int                     width)				\
-    {														\
-	int i;													\
-	for (i = 0; i < width; ++i) {							\
-		__m64 m = load8888(mask + i);		\
-		__m64 s = load8888(src + i);		\
-		__m64 d = load8888(dest + i);		\
-		__m64 sa = expand_alpha(s);			\
-		__m64 da = expand_alpha(d);			\
-		__m64 ida = negate(da);				\
-		\
-		s = pix_multiply(s,m);				\
-		m = pix_multiply(m,sa);				\
-		__m64 im = negate(m);				\
-		__m64 ima = expand_alpha(m);		\
-        \
-		uint32_t result,mada,res;			\
-	    \
-		store8888(&result,pix_add_mul(d,im,s,ida));					\
-		store8888(&mada,pix_multiply(ima,da));						\
-		store8888(&res,mmx_blend_ ## name(d,da,s,m));					\
-        \
-		*(dest + i) = result + (mada & A_MASK) + (res & RGB_MASK);	\
-	}\
-}
-
-static inline __m64
-_emulate_pminuh(__m64 s, __m64 d)
-{
-	uint64_t tmp_s = to_uint64(s);
-	uint64_t tmp_d = to_uint64(d);
-
-	__m64 res = to_m64(MIN((tmp_s & R_DMASK), (tmp_d & R_DMASK)) 
-		| MIN((tmp_s & G_DMASK), (tmp_d & G_DMASK)) 
-		| MIN((tmp_s & B_DMASK), (tmp_d & B_DMASK)));	
-
-	return res; 
-}
-
-static inline __m64
-_emulate_pmaxuh(__m64 s, __m64 d)
-{
-	uint64_t tmp_s = to_uint64(s);
-	uint64_t tmp_d = to_uint64(d);
-
-	__m64 res = to_m64(MAX((tmp_s & R_DMASK), (tmp_d & R_DMASK)) 
-		| MAX((tmp_s & G_DMASK), (tmp_d & G_DMASK)) 
-		| MAX((tmp_s & B_DMASK), (tmp_d & B_DMASK)));	
-
-	return res; 
-}
-
-#define R_GREATER(a, b) ((a > b) ? 0x0000ffff00000000ULL : 0)
-#define G_GREATER(a, b) ((a > b) ? 0x00000000ffff0000ULL : 0)
-#define B_GREATER(a, b) ((a > b) ? 0x000000000000ffffULL : 0)
-
-static inline __m64
-_emulate_pcmpgtuh(__m64 s, __m64 d)
-{
-	uint64_t tmp_s = to_uint64(s);
-	uint64_t tmp_d = to_uint64(d);
-
-	__m64 res = to_m64(R_GREATER((tmp_s & R_DMASK), (tmp_d & R_DMASK)) 
-		| G_GREATER((tmp_s & G_DMASK), (tmp_d & G_DMASK)) 
-		| B_GREATER((tmp_s & B_DMASK), (tmp_d & B_DMASK)));	
-
-	return res; 
-}
-
-static inline __m64
-_emulate_paddcmpgtuh(__m64 s, __m64 d1, __m64 d2)
-{
-	uint64_t tmp_s = to_uint64(s);
-	uint64_t tmp_d1 = to_uint64(d1);
-	uint64_t tmp_d2 = to_uint64(d2);
-
-	__m64 res = to_m64(R_GREATER((tmp_s & R_DMASK), (tmp_d1 & R_DMASK) + (tmp_d2 & R_DMASK)) 
-		| G_GREATER((tmp_s & G_DMASK), (tmp_d1 & G_DMASK) + (tmp_d2 & G_DMASK)) 
-		| B_GREATER((tmp_s & B_DMASK), (tmp_d1 & B_DMASK) + (tmp_d2 & B_DMASK)));	
-
-	return res; 
-}
-
-
-/*
- * Screen
- * B(Dca, ad, Sca, as) = Dca.sa + Sca.da - Dca.Sca
- */
-static inline __m64
-mmx_blend_screen (__m64 dca, __m64 da, __m64 sca, __m64 sa)
-{
-	__m64 scada = _mm_mullo_pi16(sca,da);
-	__m64 dcasa = _mm_mullo_pi16(dca,sa);
-	__m64 scadca = _mm_mullo_pi16(sca,dca);
-	__m64 res1 = _mm_add_pi16(scada,dcasa);
-	__m64 res = _mm_sub_pi16(res1,scadca);
-	__m64 rcmp, tmp;
-
-	res = _mm_adds_pu16(res1,MC(4x0080));
-	res = _mm_mulhi_pu16(res,MC(4x0101));
-
-
-	rcmp = _emulate_paddcmpgtuh(scadca, scada, dcasa);
-	tmp = _mm_and_si64(rcmp, MC(4x0101));
-	res = _mm_sub_pi16(res, tmp);
-
-	return res;
-}
-
-MMX_PDF_SEPARABLE_BLEND_MODE (screen)
-
-/*
- * Overlay
- * B(Dca, Da, Sca, Sa) =
- *   if 2.Dca < Da
- *     2.Sca.Dca
- *   otherwise
- *     Sa.Da - 2.(Da - Dca).(Sa - Sca)
- */
-static inline __m64
-mmx_blend_overlay (__m64 dca, __m64 da, __m64 sca, __m64 sa)
-{
-	__m64 res,ires,rcmp,multiplier = 2;
-	multiplier = _mm_shuffle_pi16(multiplier,_MM_SHUFFLE(0,0,0,0));
-
-	res = _mm_mullo_pi16(dca,multiplier);
-	rcmp = _mm_and_si64(_mm_cmpgt_pi16(da,res),RGB_DMASK);
-	res = _mm_mullo_pi16(res,sca);
-
-	if(rcmp != RGB_DMASK)
-	{
-		__m64 dd = _mm_sub_pi16(da,dca);
-		__m64 ss = _mm_sub_pi16(sa,sca);
-		dd = _mm_mullo_pi16(multiplier,dd);
-		ss = _mm_mullo_pi16(dd,ss);
-
-		ires = _mm_mullo_pi16(sa,da);
-		ires = _mm_sub_pi16(ires,ss);
-
-		res = _mm_or_si64(_mm_and_si64(rcmp,res),_mm_andn_si64(rcmp,ires));
-	}
-
-	res = _mm_adds_pu16(res,MC(4x0080));
-	res = _mm_mulhi_pu16(res,MC(4x0101));
-
-	return res;
-}
-
-MMX_PDF_SEPARABLE_BLEND_MODE (overlay)
-
-/*
- * Darken
- * B(Dca, Da, Sca, Sa) = min (Sca.Da, Dca.Sa)
- */
-static inline __m64
-mmx_blend_darken (__m64 dca, __m64 da, __m64 sca, __m64 sa)
-{
-	__m64 res;
-
-	__m64 s = _mm_mullo_pi16(sca,da);
-	__m64 d = _mm_mullo_pi16(dca,sa);
-
-	//rcmp = _mm_cmpgt_pi16(s,d);
-	//res = _mm_or_si64(_mm_and_si64(rcmp,d),_mm_andn_si64(rcmp,s));
-
-	res = _emulate_pminuh(s, d);
-	res = _mm_adds_pu16(res,MC(4x0080));
-	res = _mm_mulhi_pu16(res,MC(4x0101));
-	
-	return res;
-}
-
-MMX_PDF_SEPARABLE_BLEND_MODE (darken)
-
-/*
- * Lighten
- * B(Dca, Da, Sca, Sa) = max (Sca.Da, Dca.Sa)
- */
-static inline __m64
-mmx_blend_lighten (__m64 dca, __m64 da, __m64 sca, __m64 sa)
-{
-	__m64 res;
-
-	__m64 s = _mm_mullo_pi16(sca,da);
-	__m64 d = _mm_mullo_pi16(dca,sa);
-
-	//rcmp = _mm_cmpgt_pi16(s,d);
-	//res = _mm_or_si64(_mm_and_si64(rcmp,s),_mm_andn_si64(rcmp,d));
-	//
-	res = _emulate_pmaxuh(s, d);
-	res = _mm_adds_pu16(res,MC(4x0080));
-	res = _mm_mulhi_pu16(res,MC(4x0101));
-	
-	return res;
-}
-
-MMX_PDF_SEPARABLE_BLEND_MODE (lighten)
-
-/*
- * Hard light
- * B(Dca, Da, Sca, Sa) =
- *   if 2.Sca < Sa
- *     2.Sca.Dca
- *   otherwise
- *     Sa.Da - 2.(Da - Dca).(Sa - Sca)
- */
-static inline __m64
-mmx_blend_hard_light (__m64 dca, __m64 da, __m64 sca, __m64 sa)
-{
-	__m64 res,ires,rcmp,multiplier = 2;
-	multiplier = _mm_shuffle_pi16(multiplier,_MM_SHUFFLE(0,0,0,0));
-
-	res = _mm_mullo_pi16(sca,multiplier);
-	rcmp = _mm_and_si64(_mm_cmpgt_pi16(sa,res),RGB_DMASK);
-	res = _mm_mullo_pi16(res,dca);
-
-	if(rcmp != RGB_DMASK)
-	{
-		__m64 dd = _mm_sub_pi16(da,dca);
-		__m64 ss = _mm_sub_pi16(sa,sca);
-		dd = _mm_mullo_pi16(multiplier,dd);
-		ss = _mm_mullo_pi16(dd,ss);
-
-		ires = _mm_mullo_pi16(sa,da);
-		ires = _mm_sub_pi16(ires,ss);
-
-		res = _mm_or_si64(_mm_and_si64(rcmp,res),_mm_andn_si64(rcmp,ires));
-	}
-
-	res = _mm_adds_pu16(res,MC(4x0080));
-	res = _mm_mulhi_pu16(res,MC(4x0101));
-
-	return res;
-}
-
-MMX_PDF_SEPARABLE_BLEND_MODE (hard_light)
-
-/*
- * Difference
- * B(Dca, Da, Sca, Sa) = abs (Dca.Sa - Sca.Da)
- */
-static inline __m64
-mmx_blend_difference (__m64 dca, __m64 da, __m64 sca, __m64 sa)
-{
-	__m64 res,ires,rcmp;
-	__m64 dcasa = _mm_mullo_pi16(dca,sa);
-	__m64 scada = _mm_mullo_pi16(sca,da);
-
-	//rcmp = _mm_cmpgt_pi16(scada,dcasa);
-	
-	rcmp = _emulate_pcmpgtuh(scada, dcasa);
-	
-	res = _mm_sub_pi16(scada,dcasa);
-	ires = _mm_sub_pi16(dcasa,scada);
-
-	res = _mm_or_si64(_mm_and_si64(rcmp,res),_mm_andn_si64(rcmp,ires));
-	res = _mm_adds_pu16(res,MC(4x0080));
-	res = _mm_mulhi_pu16(res,MC(4x0101));
-
-	return res;
-}
-
-MMX_PDF_SEPARABLE_BLEND_MODE (difference)
-
-/*
- * Exclusion
- * B(Dca, Da, Sca, Sa) = (Sca.Da + Dca.Sa - 2.Sca.Dca)
- */
-/* This can be made faster by writing it directly and not using
- * PDF_SEPARABLE_BLEND_MODE, but that's a performance optimization */
-static inline __m64
-mmx_blend_exclusion (__m64 dca, __m64 da, __m64 sca, __m64 sa)
-{
-	__m64 res,tmp;
-	res = _mm_add_pi16(_mm_mullo_pi16(sca,da),_mm_mullo_pi16(dca,sa));
-	tmp = _mm_mullo_pi16(_mm_slli_pi16(dca,1),sca);
-	
-	res = _mm_sub_pi16(res,tmp);
-	res = _mm_adds_pu16(res,MC(4x0080));
-	res = _mm_mulhi_pu16(res,MC(4x0101));
-
-	return res;
-
-}
-
-MMX_PDF_SEPARABLE_BLEND_MODE (exclusion)
-
-#undef MMX_PDF_SEPARABLE_BLEND_MODE
-
 static const pixman_fast_path_t mmx_fast_paths[] =
 {
     PIXMAN_STD_FAST_PATH    (OVER, solid,    a8,       r5g6b5,   mmx_composite_over_n_8_0565       ),
@@ -5239,16 +5366,17 @@ _pixman_implementation_create_mmx (pixman_implementation_t *fallback)
     imp->combine_32[PIXMAN_OP_CONJOINT_ATOP_REVERSE] = mmx_combine_conjoint_atop_reverse_u;
     imp->combine_32[PIXMAN_OP_CONJOINT_XOR] = mmx_combine_conjoint_xor_u;
     
-	/* Multiply, Unified */
-	imp->combine_32[PIXMAN_OP_MULTIPLY] = mmx_combine_multiply_u;
-	//imp->combine_32[PIXMAN_OP_SCREEN] = mmx_combine_screen_u;
-    //imp->combine_32[PIXMAN_OP_OVERLAY] = mmx_combine_overlay_u;
+    /* Multiply, Unified */
+    imp->combine_32[PIXMAN_OP_MULTIPLY] = mmx_combine_multiply_u;
+    imp->combine_32[PIXMAN_OP_SCREEN] = mmx_combine_screen_u;
+    imp->combine_32[PIXMAN_OP_OVERLAY] = mmx_combine_overlay_u;
     imp->combine_32[PIXMAN_OP_DARKEN] = mmx_combine_darken_u;
     imp->combine_32[PIXMAN_OP_LIGHTEN] = mmx_combine_lighten_u;
-    //imp->combine_32[PIXMAN_OP_HARD_LIGHT] = mmx_combine_hard_light_u;
+    imp->combine_32[PIXMAN_OP_COLOR_DODGE] = mmx_combine_color_dodge_u;
+    imp->combine_32[PIXMAN_OP_COLOR_BURN] = mmx_combine_color_burn_u;
+    imp->combine_32[PIXMAN_OP_HARD_LIGHT] = mmx_combine_hard_light_u;
     imp->combine_32[PIXMAN_OP_DIFFERENCE] = mmx_combine_difference_u;
-    //imp->combine_32[PIXMAN_OP_EXCLUSION] = mmx_combine_exclusion_u;
-
+    imp->combine_32[PIXMAN_OP_EXCLUSION] = mmx_combine_exclusion_u;
 	
     /* Component alpha combiners */
     imp->combine_32_ca[PIXMAN_OP_SRC] = mmx_combine_src_ca;
@@ -5286,15 +5414,17 @@ _pixman_implementation_create_mmx (pixman_implementation_t *fallback)
     imp->combine_32_ca[PIXMAN_OP_CONJOINT_ATOP_REVERSE] = mmx_combine_conjoint_atop_reverse_ca;
     imp->combine_32_ca[PIXMAN_OP_CONJOINT_XOR] = mmx_combine_conjoint_xor_ca;
 
-	/* Multiply CA */
-	imp->combine_32_ca[PIXMAN_OP_MULTIPLY] = mmx_combine_multiply_ca;
-    //imp->combine_32_ca[PIXMAN_OP_SCREEN] = mmx_combine_screen_ca;
-    //imp->combine_32_ca[PIXMAN_OP_OVERLAY] = mmx_combine_overlay_ca;
+    /* Multiply CA */
+    imp->combine_32_ca[PIXMAN_OP_MULTIPLY] = mmx_combine_multiply_ca;
+    imp->combine_32_ca[PIXMAN_OP_SCREEN] = mmx_combine_screen_ca;
+    imp->combine_32_ca[PIXMAN_OP_OVERLAY] = mmx_combine_overlay_ca;
     imp->combine_32_ca[PIXMAN_OP_DARKEN] = mmx_combine_darken_ca;
     imp->combine_32_ca[PIXMAN_OP_LIGHTEN] = mmx_combine_lighten_ca;
-    //imp->combine_32_ca[PIXMAN_OP_HARD_LIGHT] = mmx_combine_hard_light_ca;
+    imp->combine_32_ca[PIXMAN_OP_COLOR_DODGE] = mmx_combine_color_dodge_ca;
+    imp->combine_32_ca[PIXMAN_OP_COLOR_BURN] = mmx_combine_color_burn_ca;
+    imp->combine_32_ca[PIXMAN_OP_HARD_LIGHT] = mmx_combine_hard_light_ca;
     imp->combine_32_ca[PIXMAN_OP_DIFFERENCE] = mmx_combine_difference_ca;
-    //imp->combine_32_ca[PIXMAN_OP_EXCLUSION] = mmx_combine_exclusion_ca;
+    imp->combine_32_ca[PIXMAN_OP_EXCLUSION] = mmx_combine_exclusion_ca;
 
     imp->blt = mmx_blt;
     imp->fill = mmx_fill;

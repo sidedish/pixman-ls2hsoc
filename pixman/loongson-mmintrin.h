@@ -89,17 +89,6 @@ _mm_adds_pu8 (__m64 __m1, __m64 __m2)
 }
 
 extern __inline __m64 __attribute__((__gnu_inline__, __always_inline__, __artificial__))
-_mm_andn_si64 (__m64 __m1, __m64 __m2)
-{
-	 __m64 ret;
-	asm("pandn %0, %1, %2\n\t"
-        : "=f" (ret)
-        : "f" (__m1), "f" (__m2)
-    );  
-    return ret;
-}
-
-extern __inline __m64 __attribute__((__gnu_inline__, __always_inline__, __artificial__))
 _mm_and_si64 (__m64 __m1, __m64 __m2)
 {
 	__m64 ret;
@@ -110,14 +99,14 @@ _mm_and_si64 (__m64 __m1, __m64 __m2)
 	return ret;
 }
 
-extern __inline __m64 __attribute__((__gnu_inline__, __always_inline__, __artificial__))                        
+extern __inline __m64 __attribute__((__gnu_inline__, __always_inline__, __artificial__))
 _mm_cmpeq_pi16 (__m64 __m1, __m64 __m2)
 {
-    __m64 ret;
-	asm("pcmpeqh %0, %1, %2\n\t"   
-		: "=f" (ret)    
-		: "f" (__m1), "f" (__m2)       
-	); 
+	__m64 ret;
+	asm("pcmpeqh %0, %1, %2\n\t"
+	   : "=f" (ret)
+	   : "f" (__m1), "f" (__m2)
+	);
 	return ret;
 }
 
@@ -353,6 +342,17 @@ _mm_sub_pi16 (__m64 __m1, __m64 __m2)
 }
 
 extern __inline __m64 __attribute__((__gnu_inline__, __always_inline__, __artificial__))
+_mm_sub_pu16 (__m64 __m1, __m64 __m2)
+{
+	__m64 ret;
+	asm("psubush %0, %1, %2\n\t"
+	   : "=f" (ret)
+	   : "f" (__m1), "f" (__m2)
+	);
+	return ret;
+}
+
+extern __inline __m64 __attribute__((__gnu_inline__, __always_inline__, __artificial__))
 _mm_unpackhi_pi8 (__m64 __m1, __m64 __m2)
 {
 	__m64 ret;
@@ -434,23 +434,37 @@ loongson_extract_pi16 (__m64 __m, int64_t __pos)
 extern __inline __m64 __attribute__((__gnu_inline__, __always_inline__, __artificial__))
 loongson_insert_pi16 (__m64 __m1, __m64 __m2, int64_t __pos)
 {
-	__m64 ret;
-	asm("pinsrh_%3 %0, %1, %2\n\t"
-	   : "=f" (ret)
-	   : "f" (__m1), "f" (__m2), "i" (__pos)
-	);
-	return ret;
+    __m64 ret;
+    
+    switch (__pos)
+        {
+        case 3:
+            asm("pinsrh_3 %0, %1, %2\n\t"
+                : "=f" (ret)
+                : "f" (__m1), "f" (__m2)
+                );
+            break;
+        case 2:
+            asm("pinsrh_2 %0, %1, %2\n\t"
+                : "=f" (ret)
+                : "f" (__m1), "f" (__m2)
+                );
+            break;
+        case 1:
+            asm("pinsrh_1 %0, %1, %2\n\t"
+                : "=f" (ret)
+                : "f" (__m1), "f" (__m2)
+                );
+            break;
+        case 0:
+            asm("pinsrh_0 %0, %1, %2\n\t"
+                : "=f" (ret)
+                : "f" (__m1), "f" (__m2)
+                );
+            break;
+        default:
+            ;;
+        }
+    
+    return ret;
 }
-
-extern __inline __m64 __attribute__((__gnu_inline__, __always_inline__, __artificial__))
-loongson_fand (__m64 __m1, __m64 __m2)
-{
-	__m64 ret;
-	asm("fand %0, %1, %2\n\t"
-	   : "=f" (ret)
-	   : "f" (__m1), "f" (__m2)
-	);
-	return ret;
-}
-
-
